@@ -1,0 +1,168 @@
+name: Build and Push Docker Images to GHCR
+
+on:
+  push:
+    branches:
+      - sogaani-test
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  DIST: ubuntu
+  TAG: latest
+  PLATFORMS: linux/amd64
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Lower-case the repository owner once; GHCR rejects upper-case image names.
+  prepare:
+    name: Prepare image names
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.owner.outputs.owner }}
+    steps:
+      - name: Lower-case repository owner
+        id: owner
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+  base:
+    name: Build base image (${{ github.ref_name }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ needs.prepare.outputs.owner }}/ubuntu-latest-open5gs-base
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/${{ env.DIST }}/${{ env.TAG }}/base
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            dist=${{ env.DIST }}
+            tag=${{ env.TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,scope=base,mode=max
+
+  build:
+    name: Build open5gs image (${{ github.ref_name }})
+    needs: [prepare, base]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ needs.prepare.outputs.owner }}/ubuntu-latest-open5gs-build
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # docker/build/Dockerfile does
+      #   FROM ${username}/${dist}-${tag}-open5gs-base
+      # so passing username=ghcr.io/<owner> makes it consume the base image
+      # pushed by the "base" job. The base image is pinned to the branch tag
+      # so this job always builds on top of the base from the same push.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/build/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            dist=${{ env.DIST }}
+            tag=${{ env.TAG }}
+            username=ghcr.io/${{ needs.prepare.outputs.owner }}
+          build-contexts: |
+            ghcr.io/${{ needs.prepare.outputs.owner }}/ubuntu-latest-open5gs-base=docker-image://ghcr.io/${{ needs.prepare.outputs.owner }}/ubuntu-latest-open5gs-base:${{ github.ref_name }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=build
+          cache-to: type=gha,scope=build,mode=max
+
+  webui:
+    name: Build webui image (${{ github.ref_name }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ needs.prepare.outputs.owner }}/open5gs-webui
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/webui/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=webui
+          cache-to: type=gha,scope=webui,mode=max
