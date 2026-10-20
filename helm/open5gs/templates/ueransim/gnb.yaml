@@ -12,16 +12,18 @@ metadata:
     {{- include "open5gs.labels" $root | nindent 4 }}
     app.kubernetes.io/component: {{ $name }}
 data:
-  # UERANSIM >= 3.3.0 accepts an IP, an FQDN or an interface name here.
+  # UERANSIM 3.3.0 resolves FQDNs (amfConfigs), but its interface-name
+  # support is broken (TryResolveHost() blanks the value before the
+  # interface lookup), so the pod IP is substituted at start instead.
   gnb.yaml: |
     mcc: '{{ $root.Values.plmn.mcc }}'
     mnc: '{{ $root.Values.plmn.mnc }}'
     nci: '{{ $g.nci }}'
     idLength: {{ $g.idLength | default 32 }}
     tac: {{ $g.tac | default $root.Values.tac }}
-    linkIp: eth0
-    ngapIp: eth0
-    gtpIp: eth0
+    linkIp: __POD_IP__
+    ngapIp: __POD_IP__
+    gtpIp: __POD_IP__
     amfConfigs:
       - address: {{ $amfNgap }}
         port: 38412
@@ -36,7 +38,9 @@ data:
     until getent hosts {{ $amfNgap }} >/dev/null; do
       echo "waiting for AMF ({{ $amfNgap }})"; sleep 3
     done
-    exec nr-gnb -c /config/gnb.yaml
+    sed "s/__POD_IP__/${POD_IP}/g" /config/gnb.yaml > /tmp/gnb.yaml
+    echo "gNB=${POD_IP} AMF={{ $amfNgap }}"
+    exec nr-gnb -c /tmp/gnb.yaml
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -73,6 +77,8 @@ spec:
           image: "{{ $root.Values.ueransim.image.repository }}:{{ $root.Values.ueransim.image.tag }}"
           imagePullPolicy: {{ $root.Values.ueransim.image.pullPolicy }}
           command: ["/bin/sh", "/config/entrypoint.sh"]
+          env:
+            {{- include "open5gs.podIpEnv" $root | nindent 12 }}
           ports:
             - name: rls
               containerPort: 4997
