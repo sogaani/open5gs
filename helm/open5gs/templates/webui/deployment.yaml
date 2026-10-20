@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "webui") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "open5gs.selector" (dict "ctx" . "name" "webui") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" . "name" "webui") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: webui
+          image: "{{ .Values.webui.image.repository }}:{{ .Values.webui.image.tag }}"
+          imagePullPolicy: {{ .Values.webui.image.pullPolicy }}
+          env:
+            - name: DB_URI
+              value: {{ include "open5gs.mongoUri" . }}
+            - name: WAIT_HOSTS
+              value: {{ include "open5gs.fqdn" (dict "ctx" . "name" "mongodb") }}:27017
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: PORT
+              value: "9999"
+          ports:
+            - name: http
+              containerPort: 9999
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9999
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.webui.resources | nindent 12 }}

@@ -1,0 +1,32 @@
+Open5GS release "{{ .Release.Name }}" deployed to namespace "{{ .Release.Namespace }}".
+
+WebUI
+  {{- if eq .Values.webui.service.type "LoadBalancer" }}
+  http://{{ .Values.webui.service.loadBalancerIP | default "<LoadBalancer IP>" }}:{{ .Values.webui.service.port }}
+  (check: kubectl -n {{ .Release.Namespace }} get svc {{ include "open5gs.component" (dict "ctx" . "name" "webui") }})
+  {{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "open5gs.component" (dict "ctx" . "name" "webui") }} 9999:{{ .Values.webui.service.port }}
+  {{- end }}
+  login: admin / 1423
+
+Subscribers
+  {{ len .Values.subscribers }} subscriber(s) inserted by the post-install Job (existing IMSIs are kept).
+
+{{- if .Values.ueransim.enabled }}
+
+UERANSIM
+  gNB log : kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  {{- range .Values.ueransim.ues }}
+  UE {{ .name }} : kubectl -n {{ $.Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" $ "name" (printf "ue-%s" .name)) }}
+  {{- end }}
+
+  Verify the user plane from the first UE:
+    UE=$(kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/component=ue-{{ (index .Values.ueransim.ues 0).name }} -o jsonpath='{.items[0].metadata.name}')
+    kubectl -n {{ .Release.Namespace }} exec $UE -- ip addr show uesimtun0
+    kubectl -n {{ .Release.Namespace }} exec $UE -- ping -I uesimtun0 -c 3 8.8.8.8
+    kubectl -n {{ .Release.Namespace }} exec $UE -- nr-cli imsi-{{ (index .Values.ueransim.ues 0).imsi }} -e status
+{{- end }}
+
+Core status
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" . "name" "amf") }}

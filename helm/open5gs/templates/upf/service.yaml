@@ -1,0 +1,27 @@
+{{- $root := . }}
+{{- range $d := .Values.dnns }}
+{{- $name := printf "upf-%s" $d.name }}
+---
+# PFCP endpoint used by the SMF. GTP-U goes straight to the pod IP that the
+# UPF reports to the SMF, so it is not exposed through this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 4 }}
+  ports:
+    - name: pfcp
+      port: 8805
+      targetPort: 8805
+      protocol: UDP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+{{- end }}

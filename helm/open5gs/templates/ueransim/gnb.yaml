@@ -1,0 +1,106 @@
+{{- if .Values.ueransim.enabled }}
+{{- $amfNgap := include "open5gs.fqdn" (dict "ctx" . "name" "amf-ngap") }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gnb
+data:
+  gnb.yaml: |
+    mcc: '{{ .Values.plmn.mcc }}'
+    mnc: '{{ .Values.plmn.mnc }}'
+    nci: '{{ .Values.ueransim.gnb.nci }}'
+    idLength: {{ .Values.ueransim.gnb.idLength }}
+    tac: {{ .Values.tac }}
+    linkIp: __POD_IP__
+    ngapIp: __POD_IP__
+    gtpIp: __POD_IP__
+    amfConfigs:
+      - address: __AMF_IP__
+        port: 38412
+    slices:
+      {{- include "open5gs.snssaiList" . | trim | nindent 6 }}
+    ignoreStreamIds: true
+    cellAccessType: nr
+  entrypoint.sh: |
+    set -e
+    # Resolve the AMF headless Service to the AMF pod IP (N2 is SCTP, so the
+    # gNB talks to the pod directly instead of through a ClusterIP).
+    until AMF_IP=$(getent hosts {{ $amfNgap }} | awk '{print $1; exit}') && [ -n "$AMF_IP" ]; do
+      echo "waiting for AMF ({{ $amfNgap }})"; sleep 3
+    done
+    sed -e "s/__POD_IP__/${POD_IP}/g" -e "s/__AMF_IP__/${AMF_IP}/g" /config/gnb.yaml > /tmp/gnb.yaml
+    echo "AMF=${AMF_IP} gNB=${POD_IP}"
+    exec nr-gnb -c /tmp/gnb.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gnb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "open5gs.selector" (dict "ctx" . "name" "gnb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" . "name" "gnb") | nindent 8 }}
+      annotations:
+        checksum/config: {{ print .Values.ueransim.gnb .Values.plmn .Values.tac .Values.slices | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gnb
+          image: "{{ .Values.ueransim.image.repository }}:{{ .Values.ueransim.image.tag }}"
+          imagePullPolicy: {{ .Values.ueransim.image.pullPolicy }}
+          command: ["/bin/sh", "/config/entrypoint.sh"]
+          env:
+            {{- include "open5gs.podIpEnv" . | nindent 12 }}
+          ports:
+            - name: rls
+              containerPort: 4997
+              protocol: UDP
+            - name: gtpu
+              containerPort: 2152
+              protocol: UDP
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "ss -lun | grep -q ':4997'"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          resources:
+            {{- toYaml .Values.ueransim.gnb.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+---
+# Headless: UEs resolve this to the gNB pod IP for the RLS link.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gnb
+spec:
+  clusterIP: None
+  selector:
+    {{- include "open5gs.selector" (dict "ctx" . "name" "gnb") | nindent 4 }}
+  ports:
+    - name: rls
+      port: 4997
+      protocol: UDP
+{{- end }}

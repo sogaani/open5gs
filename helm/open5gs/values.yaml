@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+image:
+  repository: ghcr.io/sogaani/ubuntu-latest-open5gs-build
+  tag: sogaani-test
+  # use "Always" for development, as sogaani-test is a moving target.
+  pullPolicy: Always
+
+# Secrets for pulling private images from ghcr.io, e.g. [{ name: ghcr-pull }]
+imagePullSecrets: []
+
+# Kubernetes cluster DNS domain
+clusterDomain: cluster.local
+
+# Open5GS log level: trace|debug|info|warn|error
+logLevel: info
+
+# ---------------------------------------------------------------------------
+# Network identity
+# ---------------------------------------------------------------------------
+plmn:
+  mcc: "999"
+  mnc: "70"
+tac: 1
+
+amf:
+  region: 2
+  set: 1
+  name: open5gs-amf0
+  networkName:
+    full: Open5GS
+    short: Next
+
+# Slices served by the network (AMF plmn_support, NSSF, gNB, SMF info)
+slices:
+  - sst: 1
+    # sd: "000001"
+
+# ---------------------------------------------------------------------------
+# Data networks: one entry per DNN. Every DNN gets its own SMF (smf-<dnn>) and
+# UPF (upf-<dnn>). Each SMF advertises only its DNN to the NRF, so the AMF
+# selects the SMF by DNN, like an MVNO SMF/UPF attached to an MNO core.
+# UE subnets must not overlap the pod CIDR, the service CIDR or the node LAN.
+# ---------------------------------------------------------------------------
+dnns:
+  - name: internet
+    subnet: 10.45.0.0/16
+    gateway: 10.45.0.1
+    # nodeSelector: { kubernetes.io/hostname: node-a }   # pin this DNN's SMF and UPF to a node
+  # - name: ims
+  #   subnet: 10.46.0.0/16
+  #   gateway: 10.46.0.1
+
+dns:
+  - 8.8.8.8
+  - 8.8.4.4
+mtu: 1400
+
+# ---------------------------------------------------------------------------
+# Subscribers written to MongoDB by a post-install Job (skipped if the IMSI
+# already exists). Defaults match the UERANSIM sample UE.
+# ---------------------------------------------------------------------------
+subscribers:
+  - imsi: "999700000000001"
+    key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
+    opc: "E8ED289DEBA952E4283B54E88E6183CA"
+    amf: "8000"
+    sst: 1
+    dnn: internet
+    # ipv4: 10.45.0.2   # optional static UE address inside the DNN subnet
+
+# ---------------------------------------------------------------------------
+# MongoDB
+# ---------------------------------------------------------------------------
+mongodb:
+  image: mongo:7
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: longhorn
+  resources: {}
+
+# ---------------------------------------------------------------------------
+# WebUI (subscriber management). Exposed with a LoadBalancer by default.
+# ---------------------------------------------------------------------------
+webui:
+  image:
+    repository: ghcr.io/sogaani/open5gs-webui
+    tag: sogaani-test
+    pullPolicy: IfNotPresent
+  service:
+    type: LoadBalancer
+    port: 9999
+    # Address from the Cilium LB-IPAM pool. Set to "" to let the pool choose.
+    loadBalancerIP: 172.31.254.20
+  resources: {}
+
+# ---------------------------------------------------------------------------
+# UERANSIM gNB and UE simulator (runs inside the cluster)
+# ---------------------------------------------------------------------------
+ueransim:
+  enabled: true
+  image:
+    repository: ghcr.io/sogaani/ueransim
+    tag: sogaani-test
+    pullPolicy: Always
+  gnb:
+    nci: "0x000000010"
+    idLength: 32
+    resources: {}
+  ues:
+    - name: ue1
+      imsi: "999700000000001"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      amf: "8000"
+      imei: "356938035643803"
+      sst: 1
+      dnn: internet
+  ueResources: {}
+
+# ---------------------------------------------------------------------------
+# Per-NF resources (optional)
+# ---------------------------------------------------------------------------
+resources: {}

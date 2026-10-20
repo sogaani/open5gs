@@ -1,0 +1,2 @@
+{{- $ports := list (dict "name" "ngap" "port" 38412 "protocol" "SCTP") (dict "name" "metrics" "port" 9090 "protocol" "TCP") -}}
+{{- include "open5gs.nfDeployment" (dict "ctx" . "name" "amf" "extraPorts" $ports) }}

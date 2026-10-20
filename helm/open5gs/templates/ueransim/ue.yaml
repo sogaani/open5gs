@@ -1,0 +1,130 @@
+{{- if .Values.ueransim.enabled }}
+{{- $root := . }}
+{{- $gnb := include "open5gs.fqdn" (dict "ctx" . "name" "gnb") }}
+{{- range $ue := .Values.ueransim.ues }}
+{{- $name := printf "ue-%s" $ue.name }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+data:
+  ue.yaml: |
+    supi: 'imsi-{{ $ue.imsi }}'
+    mcc: '{{ $root.Values.plmn.mcc }}'
+    mnc: '{{ $root.Values.plmn.mnc }}'
+    protectionScheme: 0
+    homeNetworkPublicKey: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'
+    homeNetworkPublicKeyId: 1
+    routingIndicator: '0000'
+    key: '{{ $ue.key }}'
+    op: '{{ $ue.opc }}'
+    opType: 'OPC'
+    amf: '{{ $ue.amf | default "8000" }}'
+    imei: '{{ $ue.imei | default "356938035643803" }}'
+    imeiSv: '4370816125816151'
+    gnbSearchList:
+      - __GNB_IP__
+    tunNetmask: '255.255.255.0'
+    useNamespace: false
+    nsNamePrefix: 'ueransim'
+    uacAic:
+      mps: false
+      mcs: false
+    uacAcc:
+      normalClass: 0
+      class11: false
+      class12: false
+      class13: false
+      class14: false
+      class15: false
+    sessions:
+      - type: 'IPv4'
+        apn: '{{ $ue.dnn | default "internet" }}'
+        slice:
+          sst: {{ $ue.sst | default 1 }}
+          {{- if $ue.sd }}
+          sd: {{ $ue.sd }}
+          {{- end }}
+    configured-nssai:
+      - sst: {{ $ue.sst | default 1 }}
+        {{- if $ue.sd }}
+        sd: {{ $ue.sd }}
+        {{- end }}
+    default-nssai:
+      - sst: {{ $ue.sst | default 1 }}
+        sd: 1
+    integrity:
+      IA1: true
+      IA2: true
+      IA3: true
+    ciphering:
+      EA1: true
+      EA2: true
+      EA3: true
+    integrityMaxRate:
+      uplink: 'full'
+      downlink: 'full'
+  entrypoint.sh: |
+    set -e
+    until GNB_IP=$(getent hosts {{ $gnb }} | awk '{print $1; exit}') && [ -n "$GNB_IP" ]; do
+      echo "waiting for gNB ({{ $gnb }})"; sleep 3
+    done
+    sed -e "s/__GNB_IP__/${GNB_IP}/g" /config/ue.yaml > /tmp/ue.yaml
+    echo "gNB=${GNB_IP}"
+    exec nr-ue -c /tmp/ue.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 8 }}
+      annotations:
+        checksum/config: {{ print $ue $root.Values.plmn | sha256sum }}
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ue
+          image: "{{ $root.Values.ueransim.image.repository }}:{{ $root.Values.ueransim.image.tag }}"
+          imagePullPolicy: {{ $root.Values.ueransim.image.pullPolicy }}
+          command: ["/bin/sh", "/config/entrypoint.sh"]
+          # nr-ue creates uesimtunN and installs ip rules/routes for it
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+          resources:
+            {{- toYaml $root.Values.ueransim.ueResources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+{{- end }}
+{{- end }}

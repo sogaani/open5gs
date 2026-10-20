@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "udr") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: udr
+data:
+  udr.yaml: |
+    db_uri: {{ include "open5gs.mongoUri" . }}
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    udr:
+      sbi:
+        {{- include "open5gs.sbiServer" (dict "ctx" . "name" "udr") | nindent 8 }}
+        {{- include "open5gs.sbiClientScp" (dict "ctx" .) | nindent 8 }}

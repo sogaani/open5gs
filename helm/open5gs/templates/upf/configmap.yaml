@@ -1,0 +1,43 @@
+{{- $root := . }}
+{{- range $d := .Values.dnns }}
+{{- $name := printf "upf-%s" $d.name }}
+{{- $prefix := (splitList "/" $d.subnet) | last }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+data:
+  upf.yaml: |
+    {{- include "open5gs.configHeader" $root | nindent 4 }}
+    upf:
+      pfcp:
+        server:
+          - address: __POD_IP__
+      gtpu:
+        server:
+          - address: __POD_IP__
+      session:
+        - subnet: {{ $d.subnet }}
+          gateway: {{ $d.gateway }}
+          dnn: {{ $d.name }}
+          dev: ogstun
+      metrics:
+        server:
+          - address: __POD_IP__
+            port: 9090
+  # Runs in a privileged init container inside the pod's network namespace:
+  # creates ogstun with the DN gateway address, enables forwarding and NATs
+  # UE traffic to the pod IP.
+  netsetup.sh: |
+    set -ex
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    ip tuntap add name ogstun mode tun || true
+    ip addr replace {{ $d.gateway }}/{{ $prefix }} dev ogstun
+    ip link set ogstun up
+    iptables -t nat -C POSTROUTING -s {{ $d.subnet }} ! -o ogstun -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s {{ $d.subnet }} ! -o ogstun -j MASQUERADE
+{{- end }}

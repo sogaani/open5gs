@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "amf") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: amf
+data:
+  amf.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    amf:
+      sbi:
+        {{- include "open5gs.sbiServer" (dict "ctx" . "name" "amf") | nindent 8 }}
+        {{- include "open5gs.sbiClientScp" (dict "ctx" .) | nindent 8 }}
+      ngap:
+        server:
+          - address: __POD_IP__
+      metrics:
+        server:
+          - address: __POD_IP__
+            port: 9090
+      guami:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+          amf_id:
+            region: {{ .Values.amf.region }}
+            set: {{ .Values.amf.set }}
+      tai:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+          tac: {{ .Values.tac }}
+      plmn_support:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+          s_nssai:
+            {{- include "open5gs.snssaiList" . | trim | nindent 12 }}
+      security:
+        integrity_order : [ NIA2, NIA1, NIA0 ]
+        ciphering_order : [ NEA0, NEA1, NEA2 ]
+      network_name:
+        full: {{ .Values.amf.networkName.full }}
+        short: {{ .Values.amf.networkName.short }}
+      amf_name: {{ .Values.amf.name }}
+      time:
+        t3512:
+          value: 540

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "mongodb") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongodb
+spec:
+  serviceName: {{ include "open5gs.component" (dict "ctx" . "name" "mongodb") }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "open5gs.selector" (dict "ctx" . "name" "mongodb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" . "name" "mongodb") | nindent 8 }}
+    spec:
+      containers:
+        - name: mongodb
+          image: {{ .Values.mongodb.image }}
+          ports:
+            - name: mongodb
+              containerPort: 27017
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          resources:
+            {{- toYaml .Values.mongodb.resources | nindent 12 }}
+      volumes:
+        - name: init
+          configMap:
+            name: {{ include "open5gs.component" (dict "ctx" . "name" "mongodb-init") }}
+        {{- if not .Values.mongodb.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.mongodb.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.mongodb.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.mongodb.persistence.size }}
+  {{- end }}

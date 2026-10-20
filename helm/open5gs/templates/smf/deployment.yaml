@@ -1,0 +1,7 @@
+{{- $root := . }}
+{{- $ports := list (dict "name" "pfcp" "port" 8805 "protocol" "UDP") (dict "name" "gtpu" "port" 2152 "protocol" "UDP") (dict "name" "metrics" "port" 9090 "protocol" "TCP") }}
+{{- range $d := .Values.dnns }}
+{{- $name := printf "smf-%s" $d.name }}
+---
+{{ include "open5gs.nfDeployment" (dict "ctx" $root "name" $name "nf" "smf" "configPath" "/smf/configmap.yaml" "extraPorts" $ports "nodeSelector" $d.nodeSelector) }}
+{{- end }}

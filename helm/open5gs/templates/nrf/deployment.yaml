@@ -1,0 +1,1 @@
+{{- include "open5gs.nfDeployment" (dict "ctx" . "name" "nrf" "extraPorts" (list)) }}
