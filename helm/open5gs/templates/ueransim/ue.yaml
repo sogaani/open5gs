@@ -1,8 +1,12 @@
 {{- if .Values.ueransim.enabled }}
 {{- $root := . }}
-{{- $gnb := include "open5gs.fqdn" (dict "ctx" . "name" "gnb") }}
+{{- $allGnbs := list }}
+{{- range .Values.ueransim.gnbs }}{{ $allGnbs = append $allGnbs .name }}{{ end }}
 {{- range $ue := .Values.ueransim.ues }}
 {{- $name := printf "ue-%s" $ue.name }}
+{{- $gnbNames := $ue.gnbs | default $allGnbs }}
+{{- $gnbFqdns := list }}
+{{- range $gn := $gnbNames }}{{ $gnbFqdns = append $gnbFqdns (include "open5gs.fqdn" (dict "ctx" $root "name" (printf "gnb-%s" $gn))) }}{{ end }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -26,8 +30,11 @@ data:
     amf: '{{ $ue.amf | default "8000" }}'
     imei: '{{ $ue.imei | default "356938035643803" }}'
     imeiSv: '4370816125816151'
+    # FQDNs of the gNB ClusterIP Services (resolved by nr-ue at startup)
     gnbSearchList:
-      - __GNB_IP__
+      {{- range $gnbFqdns }}
+      - {{ . }}
+      {{- end }}
     tunNetmask: '255.255.255.0'
     useNamespace: false
     nsNamePrefix: 'ueransim'
@@ -70,12 +77,12 @@ data:
       downlink: 'full'
   entrypoint.sh: |
     set -e
-    until GNB_IP=$(getent hosts {{ $gnb }} | awk '{print $1; exit}') && [ -n "$GNB_IP" ]; do
-      echo "waiting for gNB ({{ $gnb }})"; sleep 3
-    done
-    sed -e "s/__GNB_IP__/${GNB_IP}/g" /config/ue.yaml > /tmp/ue.yaml
-    echo "gNB=${GNB_IP}"
-    exec nr-ue -c /tmp/ue.yaml
+    # ClusterIP Services resolve as soon as they exist; this only guards
+    # against DNS not being ready yet.
+    {{- range $gnbFqdns }}
+    until getent hosts {{ . }} >/dev/null; do echo "waiting for DNS ({{ . }})"; sleep 3; done
+    {{- end }}
+    exec nr-ue -c /config/ue.yaml
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -96,7 +103,7 @@ spec:
       labels:
         {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 8 }}
       annotations:
-        checksum/config: {{ print $ue $root.Values.plmn | sha256sum }}
+        checksum/config: {{ print $ue $root.Values.plmn $gnbFqdns | sha256sum }}
     spec:
       {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets:

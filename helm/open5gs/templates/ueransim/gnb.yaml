@@ -1,70 +1,78 @@
 {{- if .Values.ueransim.enabled }}
+{{- $root := . }}
 {{- $amfNgap := include "open5gs.fqdn" (dict "ctx" . "name" "amf-ngap") }}
+{{- range $g := .Values.ueransim.gnbs }}
+{{- $name := printf "gnb-%s" $g.name }}
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
   labels:
-    {{- include "open5gs.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gnb
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
 data:
+  # UERANSIM >= 3.3.0 accepts an IP, an FQDN or an interface name here.
   gnb.yaml: |
-    mcc: '{{ .Values.plmn.mcc }}'
-    mnc: '{{ .Values.plmn.mnc }}'
-    nci: '{{ .Values.ueransim.gnb.nci }}'
-    idLength: {{ .Values.ueransim.gnb.idLength }}
-    tac: {{ .Values.tac }}
-    linkIp: __POD_IP__
-    ngapIp: __POD_IP__
-    gtpIp: __POD_IP__
+    mcc: '{{ $root.Values.plmn.mcc }}'
+    mnc: '{{ $root.Values.plmn.mnc }}'
+    nci: '{{ $g.nci }}'
+    idLength: {{ $g.idLength | default 32 }}
+    tac: {{ $g.tac | default $root.Values.tac }}
+    linkIp: eth0
+    ngapIp: eth0
+    gtpIp: eth0
     amfConfigs:
-      - address: __AMF_IP__
+      - address: {{ $amfNgap }}
         port: 38412
     slices:
-      {{- include "open5gs.snssaiList" . | trim | nindent 6 }}
+      {{- include "open5gs.snssaiList" $root | trim | nindent 6 }}
     ignoreStreamIds: true
     cellAccessType: nr
   entrypoint.sh: |
     set -e
-    # Resolve the AMF headless Service to the AMF pod IP (N2 is SCTP, so the
-    # gNB talks to the pod directly instead of through a ClusterIP).
-    until AMF_IP=$(getent hosts {{ $amfNgap }} | awk '{print $1; exit}') && [ -n "$AMF_IP" ]; do
+    # The AMF N2 Service is headless, so its record only exists once the AMF
+    # pod is ready. nr-gnb resolves the name once at startup, so wait for it.
+    until getent hosts {{ $amfNgap }} >/dev/null; do
       echo "waiting for AMF ({{ $amfNgap }})"; sleep 3
     done
-    sed -e "s/__POD_IP__/${POD_IP}/g" -e "s/__AMF_IP__/${AMF_IP}/g" /config/gnb.yaml > /tmp/gnb.yaml
-    echo "AMF=${AMF_IP} gNB=${POD_IP}"
-    exec nr-gnb -c /tmp/gnb.yaml
+    exec nr-gnb -c /config/gnb.yaml
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
   labels:
-    {{- include "open5gs.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gnb
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
 spec:
   replicas: 1
+  # One cell per gNB: never run old and new pods behind the same Service.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
-      {{- include "open5gs.selector" (dict "ctx" . "name" "gnb") | nindent 6 }}
+      {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "open5gs.selector" (dict "ctx" . "name" "gnb") | nindent 8 }}
+        {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 8 }}
       annotations:
-        checksum/config: {{ print .Values.ueransim.gnb .Values.plmn .Values.tac .Values.slices | sha256sum }}
+        checksum/config: {{ print $g $root.Values.plmn $root.Values.tac $root.Values.slices | sha256sum }}
     spec:
-      {{- with .Values.imagePullSecrets }}
+      {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.nodeSelector }}
+      nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: gnb
-          image: "{{ .Values.ueransim.image.repository }}:{{ .Values.ueransim.image.tag }}"
-          imagePullPolicy: {{ .Values.ueransim.image.pullPolicy }}
+          image: "{{ $root.Values.ueransim.image.repository }}:{{ $root.Values.ueransim.image.tag }}"
+          imagePullPolicy: {{ $root.Values.ueransim.image.pullPolicy }}
           command: ["/bin/sh", "/config/entrypoint.sh"]
-          env:
-            {{- include "open5gs.podIpEnv" . | nindent 12 }}
           ports:
             - name: rls
               containerPort: 4997
@@ -81,26 +89,32 @@ spec:
             - name: config
               mountPath: /config
           resources:
-            {{- toYaml .Values.ueransim.gnb.resources | nindent 12 }}
+            {{- toYaml ($g.resources | default dict) | nindent 12 }}
       volumes:
         - name: config
           configMap:
-            name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+            name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
 ---
-# Headless: UEs resolve this to the gNB pod IP for the RLS link.
+# Stable address for the radio link simulation (UDP 4997). UEs put this
+# Service's FQDN in gnbSearchList, so a replaced gNB pod is picked up again.
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
   labels:
-    {{- include "open5gs.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gnb
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
 spec:
-  clusterIP: None
+  type: ClusterIP
+  {{- with $g.clusterIP }}
+  clusterIP: {{ . }}
+  {{- end }}
   selector:
-    {{- include "open5gs.selector" (dict "ctx" . "name" "gnb") | nindent 4 }}
+    {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 4 }}
   ports:
     - name: rls
       port: 4997
+      targetPort: 4997
       protocol: UDP
+{{- end }}
 {{- end }}

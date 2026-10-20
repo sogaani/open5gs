@@ -11,7 +11,7 @@ in-cluster UERANSIM gNB/UE simulator.
 | upf-\<dnn\> (one per `dnns[]`) | Deployment | ClusterIP :8805/UDP | one UPF per DNN; privileged init container creates `ogstun`, enables forwarding and MASQUERADEs UE traffic |
 | mongodb | StatefulSet + PVC | ClusterIP :27017 | seeded with the WebUI admin account (admin / 1423) |
 | webui | Deployment | **LoadBalancer** :9999 | `webui.service.loadBalancerIP` is passed to Cilium LB-IPAM |
-| gnb | Deployment | headless :4997/UDP | UERANSIM `nr-gnb`; UEs resolve it for the radio link simulation |
+| gnb-\<name\> (one per `ueransim.gnbs[]`) | Deployment (Recreate) | ClusterIP :4997/UDP (optionally pinned via `clusterIP`) | UERANSIM `nr-gnb`; UEs use the Service FQDN in `gnbSearchList`, so a replaced gNB pod is found again |
 | ue-\<name\> (one per `ueransim.ues[]`) | Deployment | - | UERANSIM `nr-ue`, needs `NET_ADMIN` + `/dev/net/tun` |
 | subscribers | post-install/upgrade Job | - | inserts `subscribers[]` into MongoDB, skips existing IMSIs |
 
@@ -42,7 +42,8 @@ helm upgrade --install open5gs ./helm/open5gs -n open5gs \
 | `dnns[]` | one `internet` on `10.45.0.0/16` | Each DNN has `subnet` and `gateway`, and gets its own SMF `smf-<dnn>` and UPF `upf-<dnn>` (`nodeSelector` applies to both) |
 | `subscribers[]` | the UERANSIM sample UE | IMSI, K, OPc, sst, dnn, optional static `ipv4` |
 | `ueransim.enabled` | `true` | Deploy gNB and UEs |
-| `ueransim.ues[]` | one UE matching `subscribers[0]` | One `nr-ue` pod per entry |
+| `ueransim.gnbs[]` | one gNB `gnb1` | One `nr-gnb` pod + ClusterIP Service per entry; `nci` must be unique, `clusterIP` pins the Service address, `tac`/`nodeSelector` optional |
+| `ueransim.ues[]` | one UE matching `subscribers[0]` | One `nr-ue` pod per entry; `gnbs: [..]` limits `gnbSearchList` (default: all gNBs) |
 | `mongodb.persistence.*` | 2Gi PVC | Set `enabled: false` for an emptyDir |
 
 Example: three DNNs, which yields three SMF/UPF pairs (`smf-internet`/`upf-internet`, `smf-internet2`/`upf-internet2`, `smf-ims`/`upf-ims`). This mirrors a full MVNO bringing its own SMF and UPF to an MNO core: the shared AMF discovers the SMF for a PDU session through the NRF by DNN.
@@ -62,7 +63,11 @@ dnns:
 * PFCP: `smf-<dnn>` talks only to `*-upf-<dnn>` ClusterIP (UDP 8805). The UPF reports its own pod
   IP as the GTP-U endpoint, so the gNB sends N3 traffic straight to the UPF pod.
 * N2: the gNB resolves the headless `*-amf-ngap` Service and opens SCTP to the AMF pod,
-  avoiding SCTP Service load balancing.
+  avoiding SCTP Service load balancing. UERANSIM 3.3.0 resolves FQDNs itself, so the gNB
+  config carries the FQDN and binds `eth0` directly.
+* RLS (UE <-> gNB, UDP 4997): UEs target the gNB's ClusterIP Service FQDN. The ClusterIP is
+  stable across gNB pod restarts (and can be pinned with `clusterIP`), so UEs re-find the
+  cell without a restart. Multiple gNBs are supported; a UE lists one or more of them.
 * UE subnets exist only inside the UPF pod (`ogstun`) and in GTP-U payloads. They are
   MASQUERADEd to the pod IP, so the CNI needs no knowledge of them. They must not overlap
   the pod CIDR, the Service CIDR or the node network (check Cilium's `cluster-pool-ipv4-cidr`).
@@ -80,7 +85,7 @@ dnns:
 
 ```bash
 kubectl -n open5gs get pods
-kubectl -n open5gs logs deploy/open5gs-gnb            # expect "NG Setup procedure is successful"
+kubectl -n open5gs logs deploy/open5gs-gnb-gnb1       # expect "NG Setup procedure is successful"
 kubectl -n open5gs logs deploy/open5gs-ue-ue1         # expect "PDU Session establishment is successful"
 UE=$(kubectl -n open5gs get pod -l app.kubernetes.io/component=ue-ue1 -o jsonpath='{.items[0].metadata.name}')
 kubectl -n open5gs exec $UE -- ip addr show uesimtun0

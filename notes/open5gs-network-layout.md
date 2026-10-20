@@ -970,7 +970,149 @@ UE IP は両端の TUN では本物として扱われ、その間の 2 ホップ
 
 ---
 
-## 9. 参考
+## 9. N2 と SCTP
+
+### 9.1 gNB と AMF の間で SCTP を使う理由
+
+N2 (NGAP) のトランスポートは 3GPP TS 38.412 で SCTP と規定されている。負荷分散や地理分散のためというより、
+**電話網の信号リンクの要件** に由来する。
+
+* NGAP (5G) も S1AP (4G) も SS7 の信号網を IP に載せる SIGTRAN の流れにあり、そのために IETF が設計したのが
+  SCTP (RFC 4960)。「常時張りっぱなしで途切れてはいけない信号リンク」を TCP より安全に運ぶのが目的。
+
+| SCTP の機能 | N2 で効く理由 |
+|---|---|
+| メッセージ境界の保持 | NGAP は ASN.1 の 1 メッセージ単位で処理する。TCP のバイトストリームだと自前で区切りが必要 |
+| マルチストリーム | 1 アソシエーション内に独立した複数ストリーム。TCP だと 1 パケットの再送待ちで後続全部が止まる (head-of-line blocking) が、UE ごと・手順ごとに別ストリームにして他の UE を止めない。UERANSIM の `ignoreStreamIds` はこのストリーム番号の扱い |
+| マルチホーミング | 1 アソシエーションに複数の IP (経路) を結びつけ、経路障害時に自動で切り替える |
+| HEARTBEAT による経路監視 | トランスポート層で経路の死活を数秒単位で検知する |
+| 4-way ハンドシェイク + Cookie | SYN flood 型攻撃に強い。常時公開される信号ポートには重要 |
+
+冗長性と負荷分散がどの層にあるか:
+
+* **リンク障害**: SCTP のマルチホーミング。ローカルな回線や NIC の二重化が主目的で、地理分散を直接担うものではない。
+* **AMF の負荷分散・AMF 障害**: SCTP ではなく **NGAP 層**。gNB は AMF Set 内の複数 AMF と同時にアソシエーションを
+  張り、NG Setup Response の Relative AMF Capacity に応じて UE を振り分ける。AMF が落ちれば同じ Set の別 AMF に
+  割り当て直し、AMF 側は UE コンテキストを UDSF などで引き継ぐ。1 つの AMF に複数アソシエーション (TNLA) を
+  張る仕組みもある。
+* **地理的分散**: AMF Set を複数サイトにまたがって構成して実現する。SCTP は「1 本のアソシエーションを落とさない」
+  部分だけを受け持つ。
+
+### 9.2 マルチホーミングの実体とプログラムからの見え方
+
+「複数 NIC に同時に接続が張られる」のではなく、**1 本のアソシエーションが複数のアドレスペア (経路) を持ち、
+データは通常そのうち 1 本 (primary path) だけを流れ、残りは backup path として待機・監視される**。
+
+* TCP のコネクションは 4 つ組 (src IP:port, dst IP:port) 1 つで識別される。SCTP のアソシエーションは
+  「ローカルのアドレス集合」×「相手のアドレス集合」で識別される (内部的には Verification Tag)。
+* INIT / INIT-ACK で両端が自分の全アドレスを通知し合う。相手のアドレスを 1 つしか知らなくても、INIT-ACK で
+  残りが伝わって経路に加わる。
+* primary で `Path.Max.Retrans` 回再送に失敗すると backup に切り替わる。再送だけ別経路に流す動きもある。
+* 標準の Linux SCTP は複数経路の同時利用 (CMT) はしない。あくまでフェイルオーバー。
+
+サーバ側: ソケットは 1 つ。`bind()` の代わりに複数アドレスを渡せる `sctp_bindx()` を使う。`INADDR_ANY` に bind
+すればホストの全アドレスが自動的に含まれる。
+
+```c
+int sk = socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP);
+struct sockaddr_in addrs[2];                    /* NIC1, NIC2 */
+sctp_bindx(sk, (struct sockaddr *)addrs, 2, SCTP_BINDX_ADD_ADDR);
+listen(sk, 5);
+```
+
+クライアント側: 指定するのは IP アドレスのままだが、`connect()` の代わりに複数の相手アドレスを渡せる
+`sctp_connectx()` がある。複数渡すのは「最初の INIT をどこに送るか」の候補を増やすため。
+
+```c
+int sk = socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP);
+sctp_bindx(sk, local_addrs, 2, SCTP_BINDX_ADD_ADDR);   /* 自分側も複数 NIC を使うなら */
+struct sockaddr_in peers[2];                            /* AMF の 2 アドレス */
+sctp_assoc_t assoc_id;
+sctp_connectx(sk, (struct sockaddr *)peers, 2, &assoc_id);
+```
+
+接続後にアプリが扱うのは 1 つの fd (assoc_id) だけで、どの経路を通ったかは意識しない。経路を見たり制御したり
+する API:
+
+| API / ソケットオプション | 用途 |
+|---|---|
+| `sctp_getpaddrs()` / `sctp_getladdrs()` | 相手側 / 自分側のアドレス一覧 |
+| `SCTP_PRIMARY_ADDR` | primary にする相手アドレスの指定 |
+| `SCTP_PEER_ADDR_PARAMS` | 経路ごとの HEARTBEAT 間隔や `Path.Max.Retrans`。Open5GS の `ogs_sctp_peer_addr_params()` が `spp_hbinterval` を設定している |
+| `SCTP_PEER_ADDR_CHANGE` 通知 | 経路のダウン・復帰・primary 変更のイベント |
+
+Open5GS では `lib/sctp/ogs-lksctp.c` の `ogs_sctp_server()` が設定から得たアドレスのリストをまとめて
+`sctp_bindx()` し、クライアント側は `sctp_connectx()` を使う。
+
+Kubernetes の Pod は通常 IP を 1 つしか持たないので、Multus などで 2 枚目の NIC を付けない限りマルチホーミングは
+効かない。UERANSIM の gNB も `ngapIp` は 1 つ。Pod 障害からの回復は Kubernetes の再スケジュールと NGAP 層の
+AMF Set に頼る。
+
+### 9.3 Kubernetes (Cilium) で SCTP が通らなかった件
+
+症状: gNB が AMF の Pod IP に SCTP 接続を試み `Connection timed out`。AMF は `10.0.9.53:38412` で LISTEN 済み。
+
+切り分けの結果:
+
+* カーネルモジュールは問題なかった。gNB Pod と AMF Pod の両方で `/proc/modules` に `sctp` があり、
+  `/proc/net/sctp` も存在し、`/proc/net/protocols` に SCTP が載っていた (これらは netns ではなくホスト全体の
+  情報なので、任意の Pod から確認できる)。
+* NetworkPolicy / CiliumNetworkPolicy はなし。
+* gNB 側ノードの Cilium で `cilium-dbg monitor -v` を取りながら gNB Pod から `sctp_test` で INIT を送ると、
+  Pod を出た直後にドロップが記録された。
+
+```
+xx drop (CT: Unknown L4 protocol) flow 0x0 to endpoint 0, ifindex 35, file bpf_lxc.c:502,
+   identity 27694->unknown: 10.0.0.105:49177 -> 10.0.9.53:38412 sctp
+```
+
+* UE Pod から gNB Pod への `sctp_test` (どちらも UERANSIM イメージ、ノードをまたぐ) も届かず、Open5GS や
+  UERANSIM 固有ではなくクラスタ全体で Pod 間 SCTP が落ちていた。
+* 原因は `cilium-config` の `enable-sctp: false` (Cilium v1.20.2、routing-mode tunnel/vxlan)。Cilium の conntrack が
+  SCTP を未知の L4 として egress で破棄する。
+
+対処 (クラスタ全体の設定変更。Cilium エージェントのローリング再起動を伴う):
+
+```bash
+helm -n kube-system upgrade cilium cilium/cilium --version 1.20.2 --reuse-values --set sctp.enabled=true
+kubectl -n kube-system rollout status ds/cilium
+kubectl -n kube-system get cm cilium-config -o jsonpath='{.data.enable-sctp}'   # true
+kubectl -n open5gs rollout restart deploy/open5gs-gnb-gnb1
+kubectl -n open5gs logs -f deploy/open5gs-gnb-gnb1   # "NG Setup procedure is successful"
+```
+
+診断に使ったコマンド:
+
+```bash
+# Pod 内から SCTP の利用可否
+kubectl -n open5gs exec <pod> -- sh -c 'grep -i sctp /proc/net/protocols; grep sctp /proc/modules; ls /proc/net/sctp'
+# AMF が SCTP で listen しているか (ss -S は SCTP ソケット)
+kubectl -n open5gs exec <amf-pod> -- ss -S -l -n
+# Cilium のドロップ監視 (対象 Pod のノード上の cilium Pod で)
+kubectl -n kube-system exec <cilium-pod> -c cilium-agent -- cilium-dbg monitor --type drop
+# UERANSIM イメージには lksctp-tools が入っているので、能動的に INIT を送る試験ができる
+kubectl -n open5gs exec <gnb-pod> -- sctp_test -H 0.0.0.0 -P 0 -h <amf-pod-ip> -p 38412 -s -c 1 -x 1
+```
+
+補足: `sctp_darn -s` は標準入力からデータを送るまで INIT を出さないので、接続試験には `sctp_test` の
+クライアントモードを使う。
+
+### 9.4 UERANSIM の設定に k8s の FQDN を使えるか
+
+UERANSIM v3.3.0 では使える (v3.2.x は IP 文字列のみ)。
+
+* gNB の `amfConfigs[].address`、`linkIp` / `ngapIp` / `gtpIp` は `GetIpAddress()` (`src/utils/yaml_utils.cpp`) で
+  「FQDN を `getaddrinfo` で解決 → IP → インターフェース名」の順に解釈される。`eth0` と書けば Pod IP になる。
+  `gtpAdvertiseIp` で bind する IP と AMF に通知する GTP-U アドレスを分けることもできる。
+* UE の `gnbSearchList` は文字列のまま保持され、`InetAddress(name, 4997)` のコンストラクタが `getaddrinfo` を
+  呼ぶ (`src/utils/network.cpp`) ので FQDN でよい。
+* 解決は起動時に 1 回だけ。headless Service のレコードは Pod が Ready になるまで存在しないので、先に起動すると
+  プロセスが終了して CrashLoopBackOff で再試行になる。entrypoint の「解決できるまで待つ」ループは残す価値がある。
+  相手 Pod の IP が変わっても自動追従はしない (gNB Pod の再起動が必要)。
+
+---
+
+## 10. 参考
 
 * Quickstart (tun、NAT、ファイアウォール、加入者登録):
   https://open5gs.org/open5gs/docs/guide/01-quickstart/

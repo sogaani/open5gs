@@ -15,7 +15,9 @@ Subscribers
 {{- if .Values.ueransim.enabled }}
 
 UERANSIM
-  gNB log : kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" . "name" "gnb") }}
+  {{- range .Values.ueransim.gnbs }}
+  gNB {{ .name }} : kubectl -n {{ $.Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" $ "name" (printf "gnb-%s" .name)) }}
+  {{- end }}
   {{- range .Values.ueransim.ues }}
   UE {{ .name }} : kubectl -n {{ $.Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" $ "name" (printf "ue-%s" .name)) }}
   {{- end }}
