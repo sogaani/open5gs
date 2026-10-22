@@ -1,15 +1,18 @@
 diff --git a/src/gnb/ngap/nas.cpp b/src/gnb/ngap/nas.cpp
-index 6bd6beb..63d28b6 100644
+index 6bd6beb..fe40ae3 100644
 --- a/src/gnb/ngap/nas.cpp
 +++ b/src/gnb/ngap/nas.cpp
-@@ -28,37 +28,27 @@ namespace nr::gnb
+@@ -28,33 +28,32 @@ namespace nr::gnb
  {
  
  int32_t extractSliceInfoAndModifyPdu(OctetString &nasPdu) {
 -    nas::RegistrationRequest *regRequest = nullptr;
-+    // Peek at the Requested NSSAI of a Registration Request for AMF selection.
-+    // The PDU itself is forwarded unmodified: the AMF needs the Requested NSSAI
-+    // (the original code stripped it and dereferenced it when absent).
++    // Peek at the Requested NSSAI of a Registration Request for AMF selection,
++    // then strip it: Open5GS rejects an Initial UE Message whose Registration
++    // Request carries non-cleartext IEs such as the Requested NSSAI
++    // (TS 24.501 4.4.6, "Non cleartext IEs is included"). Any other initial
++    // NAS message, or a Registration Request without the IE, is left as is;
++    // the original code dereferenced the absent IE.
      int32_t requestedSliceType = -1;
 -    const uint8_t *m_data = nasPdu.data();
 -    size_t m_dataLength = nasPdu.length(); 
@@ -36,10 +39,6 @@ index 6bd6beb..63d28b6 100644
 -    }
 -    if (regRequest && regRequest->requestedNSSAI) 
 -        regRequest->requestedNSSAI = std::nullopt;  
--
--    OctetString modifiedNasPdu;
--    nas::EncodeNasMessage(*nasMessage, modifiedNasPdu);
--    nasPdu = std::move(modifiedNasPdu);
 +    OctetView octetView(nasPdu.data(), nasPdu.length());
 +    auto nasMessage = nas::DecodeNasMessage(octetView);
 +    if (nasMessage == nullptr)
@@ -55,8 +54,10 @@ index 6bd6beb..63d28b6 100644
 +    auto *regRequest = dynamic_cast<nas::RegistrationRequest *>(plainMmMessage);
 +    if (regRequest == nullptr || !regRequest->requestedNSSAI.has_value())
 +        return requestedSliceType;
++
 +    if (!regRequest->requestedNSSAI->sNssais.empty())
 +        requestedSliceType = static_cast<uint8_t>(regRequest->requestedNSSAI->sNssais[0].sst);
-     return requestedSliceType;
- }
++    regRequest->requestedNSSAI = std::nullopt;
  
+     OctetString modifiedNasPdu;
+     nas::EncodeNasMessage(*nasMessage, modifiedNasPdu);

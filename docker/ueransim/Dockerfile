@@ -11,7 +11,7 @@ RUN apt-get update && \
 # Local fixes on top of the release (see patches/README.md):
 #   0001 UE: also select non-forbidden visited PLMNs (roaming)
 #   0002 gNB: Service Request / non-registration initial NAS reached no AMF
-#   0003 gNB: keep the Requested NSSAI in the Registration Request
+#   0003 gNB: do not dereference an absent Requested NSSAI
 COPY patches/ /patches/
 RUN git clone --depth 1 --branch ${UERANSIM_VERSION} https://github.com/aligungr/UERANSIM.git /UERANSIM && \
     cd /UERANSIM && \
