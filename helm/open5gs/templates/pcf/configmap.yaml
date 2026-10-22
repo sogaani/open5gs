@@ -17,3 +17,8 @@ data:
         server:
           - address: __POD_IP__
             port: 9090
+      {{- if .Values.roaming.enabled }}
+      # Local policy for roaming subscribers (no UDR data for them in this PLMN)
+      policy:
+        {{- include "open5gs.roamingPcfPolicy" . | trim | nindent 8 }}
+      {{- end }}

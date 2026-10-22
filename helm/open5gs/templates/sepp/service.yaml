@@ -1,0 +1,6 @@
+{{- if .Values.roaming.enabled }}
+{{- $ports := .Values.roaming.sepp.ports }}
+{{- $extra := list (dict "name" "n32c" "port" $ports.n32c "protocol" "TCP") (dict "name" "n32f" "port" $ports.n32f "protocol" "TCP") }}
+{{- /* Reached by peer SEPPs on n32c/n32f (its FQDN is the N32 identity and the TLS SAN) */}}
+{{- include "open5gs.nfService" (dict "ctx" . "name" "sepp" "extraPorts" $extra) }}
+{{- end }}

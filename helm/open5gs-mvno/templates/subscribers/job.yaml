@@ -1,0 +1,85 @@
+{{- if .Values.subscribers }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "subscribers") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: subscribers
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+data:
+  # Document layout copied from misc/db/open5gs-dbctl "add".
+  subscribers.js: |
+    db = db.getSiblingDB('open5gs');
+    function ambr() { return { downlink: { value: NumberInt(1000000000), unit: NumberInt(0) },
+                               uplink:   { value: NumberInt(1000000000), unit: NumberInt(0) } }; }
+    function add(s) {
+      if (db.subscribers.countDocuments({ imsi: s.imsi }) > 0) { print('exists ' + s.imsi); return; }
+      var session = {
+        name: s.dnn, type: NumberInt(3),
+        qos: { index: NumberInt(9), arp: { priority_level: NumberInt(8),
+               pre_emption_capability: NumberInt(1), pre_emption_vulnerability: NumberInt(2) } },
+        ambr: ambr(), pcc_rule: [], _id: new ObjectId() };
+      if (s.ipv4) { session.ue = { ipv4: s.ipv4 }; }
+      var slice = { sst: NumberInt(s.sst), default_indicator: true, session: [session], _id: new ObjectId() };
+      if (s.sd) { slice.sd = s.sd; }
+      db.subscribers.insertOne({
+        _id: new ObjectId(), schema_version: NumberInt(1), imsi: s.imsi,
+        msisdn: [], imeisv: [], mme_host: [], mm_realm: [], purge_flag: [],
+        slice: [slice],
+        security: { k: s.key, op: null, opc: s.opc, amf: s.amf },
+        ambr: ambr(),
+        access_restriction_data: 32, network_access_mode: 0, subscriber_status: 0,
+        operator_determined_barring: 0, subscribed_rau_tau_timer: 12, __v: 0 });
+      print('added ' + s.imsi);
+    }
+    {{- range .Values.subscribers }}
+    add({ imsi: {{ .imsi | quote }}, key: {{ .key | quote }}, opc: {{ .opc | quote }},
+          amf: {{ .amf | default "8000" | quote }}, sst: {{ .sst | default 1 }},
+          sd: {{ .sd | default "" | quote }}, dnn: {{ .dnn | default "internet" | quote }},
+          ipv4: {{ .ipv4 | default "" | quote }} });
+    {{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "subscribers") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: subscribers
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" . "name" "subscribers") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mongosh
+          image: {{ .Values.mongodb.image }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              URI={{ include "open5gs.mongoUri" . | quote }}
+              for i in $(seq 1 60); do
+                mongosh --quiet "$URI" --eval 'db.adminCommand("ping").ok' >/dev/null 2>&1 && break
+                echo "waiting for mongodb ($i)"; sleep 5
+              done
+              mongosh --quiet "$URI" /scripts/subscribers.js
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "open5gs.component" (dict "ctx" . "name" "subscribers") }}
+{{- end }}

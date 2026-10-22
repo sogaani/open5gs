@@ -195,3 +195,51 @@ ueransim:
 # Per-NF resources (optional)
 # ---------------------------------------------------------------------------
 resources: {}
+
+# ---------------------------------------------------------------------------
+# Roaming (SEPP / N32). Off by default: nothing below changes the rendering
+# until roaming.enabled is true. See README "Roaming" and values-roaming.yaml.
+#
+# With roaming on, the NFs in fqdnNfs and every SMF advertise the 3GPP FQDN
+# <component>.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org:7777 instead of their
+# Service name. Open5GS routes a request to the SEPP only when the target is
+# such an FQDN of another PLMN, and resolves it at startup, so each of those
+# Services gets a pinned ClusterIP and every NF pod gets matching hostAliases.
+# dnns[].clusterIP is therefore required when roaming is enabled.
+# ---------------------------------------------------------------------------
+roaming:
+  enabled: false
+  # component -> pinned ClusterIP (inside the Service CIDR). A visited PLMN
+  # needs nrf (and the SMFs via dnns[].clusterIP); a home PLMN also needs
+  # ausf, udm and nssf so the visited AMF can reach them through the SEPP.
+  fqdnNfs:
+    nrf: 192.96.0.40
+  # PLMNs reachable through our SEPP (their SEPP's N32 identity and ports).
+  peers:
+    - mcc: "999"
+      mnc: "71"
+      sepp:
+        host: mvno-sepp.mvno.svc.cluster.local
+        n32cPort: 7778
+        n32fPort: 7779
+  sepp:
+    # N32 identity sent in the N32-c handshake; the peer lists it as "receiver".
+    # "" = this SEPP's own Service FQDN (<release>-sepp.<namespace>.svc.<domain>).
+    sender: ""
+    ports:
+      n32c: 7778
+      n32f: 7779
+    tls:
+      # Secret with ca.crt / tls.crt / tls.key (create it with helm/sepp-certs/make-certs.sh).
+      # Alternatively pass the PEMs in ca/cert/key (e.g. --set-file) and the chart creates the Secret.
+      existingSecret: sepp-tls
+      ca: ""
+      cert: ""
+      key: ""
+      # Mutual TLS on N32 (verify_client + client certificate)
+      verifyClient: true
+  pcf:
+    # Local V-PCF policy entries for roaming subscribers (pcf.policy[] syntax, see
+    # configs/open5gs/pcf.yaml.in). [] = one auto-generated entry per peer covering
+    # every slice and DNN with QoS index 9 and 1 Gbps AMBR.
+    policy: []

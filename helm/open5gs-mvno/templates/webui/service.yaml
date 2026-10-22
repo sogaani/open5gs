@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "webui") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webui
+  {{- if and (eq .Values.webui.service.type "LoadBalancer") .Values.webui.service.loadBalancerIP }}
+  annotations:
+    # Cilium LB-IPAM honours this annotation; spec.loadBalancerIP below is
+    # kept for other load-balancer implementations.
+    io.cilium/lb-ipam-ips: {{ .Values.webui.service.loadBalancerIP | quote }}
+  {{- end }}
+spec:
+  type: {{ .Values.webui.service.type }}
+  {{- if and (eq .Values.webui.service.type "LoadBalancer") .Values.webui.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.webui.service.loadBalancerIP }}
+  {{- end }}
+  selector:
+    {{- include "open5gs.selector" (dict "ctx" . "name" "webui") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.webui.service.port }}
+      targetPort: 9999
+      protocol: TCP

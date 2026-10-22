@@ -1,0 +1,57 @@
+{{- if .Values.roaming.enabled }}
+{{- $tls := .Values.roaming.sepp.tls }}
+{{- $ports := .Values.roaming.sepp.ports }}
+# SEPP: the only NF that talks to other PLMNs. SBI (7777) faces our own SCP;
+# N32-c (n32c) and N32-f (n32f) face the peer SEPPs over HTTPS. The peer for a
+# request is chosen by the PLMN parsed from the 3GPP FQDN in the target apiRoot;
+# the peer's PLMN is learned in the N32-c handshake, so each SEPP must be
+# registered with its NRF (serving PLMN) before the handshake succeeds.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "sepp") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sepp
+data:
+  sepp.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    sepp:
+      default:
+        tls:
+          server:
+            private_key: /tls/tls.key
+            cert: /tls/tls.crt
+            {{- if $tls.verifyClient }}
+            verify_client: true
+            verify_client_cacert: /tls/ca.crt
+            {{- end }}
+          client:
+            cacert: /tls/ca.crt
+            {{- if $tls.verifyClient }}
+            client_private_key: /tls/tls.key
+            client_cert: /tls/tls.crt
+            {{- end }}
+      sbi:
+        {{- include "open5gs.sbiServer" (dict "ctx" . "name" "sepp") | nindent 8 }}
+        {{- include "open5gs.sbiClientScp" (dict "ctx" .) | nindent 8 }}
+      n32:
+        server:
+          - sender: {{ include "open5gs.seppSender" . }}
+            scheme: https
+            address: __POD_IP__
+            port: {{ $ports.n32c }}
+            n32f:
+              scheme: https
+              address: __POD_IP__
+              port: {{ $ports.n32f }}
+        client:
+          sepp:
+            {{- range .Values.roaming.peers }}
+            # PLMN {{ .mcc }}/{{ .mnc }}
+            - receiver: {{ .sepp.host }}
+              uri: https://{{ .sepp.host }}:{{ .sepp.n32cPort }}
+              n32f:
+                uri: https://{{ .sepp.host }}:{{ .sepp.n32fPort }}
+            {{- end }}
+{{- end }}

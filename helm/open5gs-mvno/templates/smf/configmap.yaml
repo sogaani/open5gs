@@ -1,0 +1,55 @@
+{{- $root := . }}
+{{- range $d := .Values.dnns }}
+{{- $name := include "open5gs.dnnName" (dict "ctx" $root "prefix" "smf" "dnn" $d) }}
+---
+# One SMF per dnns[] entry. Each SMF advertises only its own DNN (and, when the
+# entry sets sst, only that S-NSSAI) in SmfInfo, so the AMF selects it through
+# NRF discovery by S-NSSAI + DNN (the MNO-core / MVNO-SMF pattern).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+data:
+  smf.yaml: |
+    {{- include "open5gs.configHeader" $root | nindent 4 }}
+    smf:
+      sbi:
+        {{- include "open5gs.sbiServer" (dict "ctx" $root "name" $name "nf" "smf") | nindent 8 }}
+        {{- include "open5gs.sbiClientScp" (dict "ctx" $root) | nindent 8 }}
+      pfcp:
+        server:
+          - address: __POD_IP__
+        client:
+          upf:
+            - address: {{ include "open5gs.fqdn" (dict "ctx" $root "name" (include "open5gs.dnnName" (dict "ctx" $root "prefix" "upf" "dnn" $d))) }}
+              dnn: {{ $d.name }}
+      gtpu:
+        server:
+          - address: __POD_IP__
+      metrics:
+        server:
+          - address: __POD_IP__
+            port: 9090
+      session:
+        - subnet: {{ $d.subnet }}
+          gateway: {{ $d.gateway }}
+          dnn: {{ $d.name }}
+      dns:
+        {{- range $root.Values.dns }}
+        - {{ . }}
+        {{- end }}
+      mtu: {{ $root.Values.mtu }}
+      info:
+        - s_nssai:
+            {{- range (include "open5gs.dnnSlices" (dict "ctx" $root "dnn" $d) | fromYamlArray) }}
+            - sst: {{ .sst }}
+              {{- if .sd }}
+              sd: {{ .sd | quote }}
+              {{- end }}
+              dnn:
+                - {{ $d.name }}
+            {{- end }}
+{{- end }}

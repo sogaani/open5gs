@@ -45,6 +45,13 @@ helm upgrade --install open5gs ./helm/open5gs -n open5gs \
 | `ueransim.gnbs[]` | one gNB `gnb1` | One `nr-gnb` pod + ClusterIP Service per entry; `nci` must be unique, `clusterIP` pins the Service address, `tac`/`nodeSelector` optional |
 | `ueransim.ues[]` | one UE matching `subscribers[0]` | One `nr-ue` pod per entry; `gnbs: [..]` limits `gnbSearchList` (default: all gNBs) |
 | `mongodb.persistence.*` | 2Gi PVC | Set `enabled: false` for an emptyDir |
+| `ueransim.ues[].hplmn` | unset (= `plmn`) | Home PLMN of the USIM (`{mcc, mnc}`); set it to simulate a roaming UE of another PLMN |
+| `roaming.enabled` | `false` | Act as a Visited PLMN: deploy a SEPP and advertise 3GPP FQDNs (see Roaming) |
+| `roaming.fqdnNfs` | `{nrf: 192.96.0.40}` | NFs that advertise `<nf>.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org:7777`, with their pinned ClusterIP |
+| `roaming.peers[]` | the `mvno` release | Peer PLMNs: `mcc`, `mnc`, `sepp.host` (peer SEPP Service FQDN), `sepp.n32cPort`, `sepp.n32fPort` |
+| `roaming.sepp.*` | ports 7778/7779, Secret `sepp-tls` | N32 identity (`sender`), listener ports, TLS Secret (`tls.existingSecret` or `tls.ca/cert/key` PEM), `tls.verifyClient` |
+| `roaming.pcf.policy` | `[]` (auto) | V-PCF local policy for roaming SUPIs; auto-generates one entry per peer |
+| `dnns[].clusterIP` | unset | Required with roaming: pinned ClusterIP of that SMF's Service |
 
 Example: three DNNs, which yields three SMF/UPF pairs (`smf-internet`/`upf-internet`, `smf-internet2`/`upf-internet2`, `smf-ims`/`upf-ims`). This mirrors a full MVNO bringing its own SMF and UPF to an MNO core: the shared AMF discovers the SMF for a PDU session through the NRF by DNN.
 
@@ -122,3 +129,75 @@ UE=$(kubectl -n open5gs get pod -l app.kubernetes.io/component=ue-ue1 -o jsonpat
 kubectl -n open5gs exec $UE -- ip addr show uesimtun0
 kubectl -n open5gs exec $UE -- ping -I uesimtun0 -c 3 8.8.8.8
 ```
+
+## Roaming (SEPP, Home-Routed) with `helm/open5gs-mvno`
+
+`roaming.enabled: true` turns this release into the **Visited PLMN** of one or more home PLMNs
+deployed with [`helm/open5gs-mvno`](../open5gs-mvno/README.md) (a full MVNO: AUSF/UDM/UDR/PCF and
+H-SMF/H-UPF of PLMN 999/71). Authentication, subscription data and, with Home-Routed roaming, the
+PDU session anchor live in the MVNO; this core keeps the RAN, the AMF and the V-SMF/V-UPF.
+Nothing changes while `roaming.enabled` is false (the default render is byte-identical).
+
+What the chart adds in roaming mode:
+
+* **SEPP** (`<release>-sepp`): SBI 7777 towards our SCP, N32-c 7778 and N32-f 7779 over HTTPS
+  towards each `roaming.peers[].sepp.host`. The Service FQDN is the N32 identity (`sender`), the
+  peer lists it as `receiver`, and the TLS certificate must carry it as CN/SAN.
+* **3GPP FQDNs**: Open5GS sends a request to the SEPP only when the target apiRoot is
+  `<label>.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` of another PLMN. So the NRF (and every SMF, for
+  H-SMF callbacks) advertise such names (`advertise: <fqdn>:7777`). Open5GS resolves the `advertise`
+  name at startup and the SCP resolves same-PLMN targets, so each of these Services gets a pinned
+  ClusterIP (`roaming.fqdnNfs`, `dnns[].clusterIP`) that is injected into every NF pod as
+  `hostAliases`. Every such Service also exposes port 80 -> 7777: peers build apiRoots from the
+  NF-instance FQDN without a port (`hSmfUri`, the synthesized `nrf.<domain>`), which means port 80.
+* **AMF** `access_control` allows the peers' home PLMNs; **PCF** gets a local `policy` for their
+  SUPI ranges (no UDR data for them here).
+* **UEs**: `ueransim.ues[].hplmn` makes a UE a subscriber of the MVNO (IMSI `99971...`).
+  Stock UERANSIM v3.3.0 never selects a PLMN other than its HPLMN; the image built from
+  `docker/ueransim` carries patches for that and for the Service Request bug.
+
+### Steps
+
+```bash
+# 1. TLS material for both SEPPs (same CA), as Secret "sepp-tls" in each namespace
+helm/sepp-certs/make-certs.sh helm/sepp-certs/certs \
+  open5gs-sepp.open5gs.svc.cluster.local mvno-sepp.mvno.svc.cluster.local
+kubectl create ns mvno
+kubectl -n open5gs create secret generic sepp-tls --from-file=ca.crt=helm/sepp-certs/certs/ca.crt \
+  --from-file=tls.crt=helm/sepp-certs/certs/open5gs-sepp.open5gs.svc.cluster.local.crt \
+  --from-file=tls.key=helm/sepp-certs/certs/open5gs-sepp.open5gs.svc.cluster.local.key
+kubectl -n mvno create secret generic sepp-tls --from-file=ca.crt=helm/sepp-certs/certs/ca.crt \
+  --from-file=tls.crt=helm/sepp-certs/certs/mvno-sepp.mvno.svc.cluster.local.crt \
+  --from-file=tls.key=helm/sepp-certs/certs/mvno-sepp.mvno.svc.cluster.local.key
+
+# 2. Home PLMN
+helm upgrade --install mvno ./helm/open5gs-mvno -n mvno
+
+# 3. This chart as Visited PLMN (values-roaming.yaml is an example overlay: pinned ClusterIPs,
+#    the roaming UE ue4). Existing NRF/SMF Services must be recreated because clusterIP is immutable.
+kubectl -n open5gs delete svc open5gs-nrf open5gs-smf-internet-sst1 open5gs-smf-internet-sst2 open5gs-smf-ims
+helm upgrade open5gs ./helm/open5gs -n open5gs -f <your values> -f helm/open5gs/values-roaming.yaml
+```
+
+### Verify
+
+```bash
+kubectl -n open5gs logs deploy/open5gs-sepp | grep "SEPP established"   # N32-c handshake, both sides
+kubectl -n mvno    logs deploy/mvno-sepp    | grep "SEPP established"
+kubectl -n open5gs logs deploy/open5gs-amf  | grep -i "Home-Routed Roaming"   # for imsi-99971...
+kubectl -n mvno    logs deploy/mvno-smf-internet | grep "UE SUPI"            # IPv4[10.50.x.x]
+UE=$(kubectl -n open5gs get pod -l app.kubernetes.io/component=ue-ue4 -o jsonpath='{.items[0].metadata.name}')
+kubectl -n open5gs exec $UE -- ip addr show uesimtun0      # 10.50.0.0/16 = anchored in the MVNO UPF
+kubectl -n open5gs exec $UE -- ping -I uesimtun0 -c 3 8.8.8.8
+```
+
+Known behaviour (Open5GS 2.8.0):
+
+* If the peer SEPP connects before this SEPP has registered with its NRF, the SEPP aborts once with
+  `Assertion 'OGS_FSM_STATE(&sepp_node->sm)' failed` and the pod restarts; the handshake then succeeds.
+* If the N16 create towards the H-SMF times out, the V-SMF aborts on the UE's retransmission
+  (`smf_nsmf_pdusession_build_hsmf_update_data: Assertion 'sess->pdu_session_resource_uri'`). The AMF
+  then keeps stale SM contexts and rejects re-registrations with `5GS services not allowed` after a
+  404 from the restarted SMF; `kubectl -n open5gs rollout restart deploy/open5gs-amf` clears it.
+* UERANSIM's gNB strips the Requested NSSAI from the Registration Request because Open5GS rejects
+  it as a non-cleartext IE; the AMF uses the subscribed default S-NSSAI.

@@ -1,0 +1,78 @@
+# Example overlay: the MNO (999/70) acting as the Visited PLMN for the MVNO
+# chart (helm/open5gs-mvno, PLMN 999/71). Apply on top of your values:
+#   helm upgrade open5gs ./helm/open5gs -n open5gs -f <your values> -f values-roaming.yaml
+# Prerequisites: Secret sepp-tls in this namespace (helm/sepp-certs/make-certs.sh),
+# the mvno release running, and a UERANSIM image built with docker/ueransim/patches.
+roaming:
+  enabled: true
+  fqdnNfs:
+    nrf: 192.96.0.40
+  peers:
+    - mcc: "999"
+      mnc: "71"
+      sepp:
+        host: mvno-sepp.mvno.svc.cluster.local
+        n32cPort: 7778
+        n32fPort: 7779
+
+# Every SMF advertises a 3GPP FQDN in roaming mode, so each needs a pinned ClusterIP.
+# Lists replace lists in Helm: repeat your full dnns[] here.
+dnns:
+  - name: internet
+    sst: 1
+    subnet: 10.45.0.0/16
+    gateway: 10.45.0.1
+    clusterIP: 192.96.0.41
+  - name: internet
+    sst: 2
+    subnet: 10.46.0.0/16
+    gateway: 10.46.0.1
+    clusterIP: 192.96.0.42
+  - name: ims
+    subnet: 10.47.0.0/16
+    gateway: 10.47.0.1
+    clusterIP: 192.96.0.43
+
+# Roaming UE: USIM of the MVNO (IMSI 99971..., hplmn 999/71) camping on the MNO gNB.
+# The subscriber itself lives in the MVNO chart (helm/open5gs-mvno values: subscribers[]).
+ueransim:
+  ues:
+    - name: ue1
+      imsi: "999700000000001"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      amf: "8000"
+      imei: "356938035643803"
+      sst: 1
+      dnn: internet
+      gnbs: [gnb1]
+    - name: ue2
+      imsi: "999700000000002"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6BD"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      amf: "8000"
+      imei: "356938035643804"
+      sst: 2
+      dnn: internet
+      gnbs: [gnb2]
+    - name: ue3
+      imsi: "999700000000003"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6BF"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      amf: "8000"
+      imei: "356938035643805"
+      sst: 1
+      dnn: ims
+      gnbs: [gnb1, gnb2]
+    - name: ue4
+      imsi: "999710000000001"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6C1"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      amf: "8000"
+      imei: "356938035643806"
+      sst: 1
+      dnn: internet
+      gnbs: [gnb1]
+      hplmn:
+        mcc: "999"
+        mnc: "71"

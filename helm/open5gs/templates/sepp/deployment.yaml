@@ -1,0 +1,7 @@
+{{- if .Values.roaming.enabled }}
+{{- $ports := .Values.roaming.sepp.ports }}
+{{- $extra := list (dict "name" "n32c" "port" $ports.n32c "protocol" "TCP") (dict "name" "n32f" "port" $ports.n32f "protocol" "TCP") }}
+{{- $mounts := list (dict "name" "tls" "mountPath" "/tls" "readOnly" true) }}
+{{- $vols := list (dict "name" "tls" "secret" (dict "secretName" (include "open5gs.seppTlsSecret" .))) }}
+{{- include "open5gs.nfDeployment" (dict "ctx" . "name" "sepp" "extraPorts" $extra "extraVolumeMounts" $mounts "extraVolumes" $vols) }}
+{{- end }}

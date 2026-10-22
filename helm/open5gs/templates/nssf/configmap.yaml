@@ -14,7 +14,7 @@ data:
         {{- include "open5gs.sbiClientScp" (dict "ctx" .) | nindent 8 }}
           nsi:
             {{- range .Values.slices }}
-            - uri: http://{{ include "open5gs.fqdn" (dict "ctx" $ "name" "nrf") }}:7777
+            - uri: {{ include "open5gs.nrfUri" $ }}
               s_nssai:
                 sst: {{ .sst }}
                 {{- if .sd }}

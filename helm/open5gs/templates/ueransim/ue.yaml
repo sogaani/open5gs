@@ -17,9 +17,11 @@ metadata:
     app.kubernetes.io/component: {{ $name }}
 data:
   ue.yaml: |
+    {{- /* Home PLMN of the USIM; ues[].hplmn simulates a roaming (e.g. MVNO) UE */}}
+    {{- $hplmn := $ue.hplmn | default dict }}
     supi: 'imsi-{{ $ue.imsi }}'
-    mcc: '{{ $root.Values.plmn.mcc }}'
-    mnc: '{{ $root.Values.plmn.mnc }}'
+    mcc: '{{ $hplmn.mcc | default $root.Values.plmn.mcc }}'
+    mnc: '{{ $hplmn.mnc | default $root.Values.plmn.mnc }}'
     protectionScheme: 0
     homeNetworkPublicKey: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'
     homeNetworkPublicKeyId: 1

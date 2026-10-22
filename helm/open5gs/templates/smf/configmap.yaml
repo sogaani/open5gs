@@ -17,7 +17,7 @@ data:
     {{- include "open5gs.configHeader" $root | nindent 4 }}
     smf:
       sbi:
-        {{- include "open5gs.sbiServer" (dict "ctx" $root "name" $name) | nindent 8 }}
+        {{- include "open5gs.sbiServer" (dict "ctx" $root "name" $name "nf" "smf") | nindent 8 }}
         {{- include "open5gs.sbiClientScp" (dict "ctx" $root) | nindent 8 }}
       pfcp:
         server:

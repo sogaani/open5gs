@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "bsf") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bsf
+data:
+  bsf.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    bsf:
+      sbi:
+        {{- include "open5gs.sbiServer" (dict "ctx" . "name" "bsf") | nindent 8 }}
+        {{- include "open5gs.sbiClientScp" (dict "ctx" .) | nindent 8 }}

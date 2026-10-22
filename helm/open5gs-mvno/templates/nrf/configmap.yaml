@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "nrf") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nrf
+data:
+  nrf.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    nrf:
+      serving:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+      sbi:
+        {{- include "open5gs.sbiServer" (dict "ctx" . "name" "nrf") | nindent 8 }}

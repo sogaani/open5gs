@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Home PLMN of a full MVNO. Same value layout as helm/open5gs (the templates
+# are copies of that chart minus AMF and UERANSIM); roaming is always on here.
+# Subscribers of this PLMN attach through the MNO's RAN/AMF (helm/open5gs with
+# roaming.enabled) and reach this core via SEPP: authentication (AUSF/UDM),
+# subscription data (UDM/UDR), policy (PCF) and, with Home-Routed roaming,
+# the PDU session anchor (H-SMF/H-UPF: the UE gets an address from dnns[]).
+# ---------------------------------------------------------------------------
+image:
+  repository: ghcr.io/sogaani/ubuntu-latest-open5gs-build
+  tag: sogaani-test
+  pullPolicy: Always
+
+imagePullSecrets: []
+clusterDomain: cluster.local
+logLevel: info
+
+# ---------------------------------------------------------------------------
+# Network identity (must differ from the MNO's PLMN)
+# ---------------------------------------------------------------------------
+plmn:
+  mcc: "999"
+  mnc: "71"
+
+slices:
+  - sst: 1
+
+# Data networks anchored in the MVNO (H-SMF/H-UPF). The DNN name must also
+# exist in the visited PLMN (the V-SMF is selected by S-NSSAI + DNN there).
+# clusterIP is required: the SMF advertises its 3GPP FQDN (see roaming).
+dnns:
+  - name: internet
+    subnet: 10.50.0.0/16
+    gateway: 10.50.0.1
+    clusterIP: 192.96.0.54
+
+dns:
+  - 8.8.8.8
+  - 8.8.4.4
+mtu: 1400
+
+# ---------------------------------------------------------------------------
+# MVNO subscribers (IMSI starts with <mcc><mnc>). lbo_roaming_allowed is left
+# unset, i.e. Home-Routed roaming. The matching UERANSIM UE is defined in the
+# MNO chart with ueransim.ues[].hplmn = this PLMN.
+# ---------------------------------------------------------------------------
+subscribers:
+  - imsi: "999710000000001"
+    key: "465B5CE8B199B49FAA5F0A2EE238A6C1"
+    opc: "E8ED289DEBA952E4283B54E88E6183CA"
+    amf: "8000"
+    sst: 1
+    dnn: internet
+
+mongodb:
+  image: mongo:7
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: longhorn
+  resources: {}
+
+webui:
+  image:
+    repository: ghcr.io/sogaani/open5gs-webui
+    tag: sogaani-test
+    pullPolicy: IfNotPresent
+  service:
+    type: LoadBalancer
+    port: 9999
+    loadBalancerIP: 172.31.254.21
+  resources: {}
+
+# ---------------------------------------------------------------------------
+# Roaming (always enabled for the home PLMN). NRF, AUSF, UDM, NSSF and every
+# SMF advertise <component>.5gc.mnc071.mcc999.3gppnetwork.org:7777; the
+# pinned ClusterIPs below are injected into every NF pod as hostAliases.
+# ---------------------------------------------------------------------------
+roaming:
+  enabled: true
+  fqdnNfs:
+    nrf: 192.96.0.50
+    ausf: 192.96.0.51
+    udm: 192.96.0.52
+    nssf: 192.96.0.53
+  peers:
+    - mcc: "999"
+      mnc: "70"
+      sepp:
+        host: open5gs-sepp.open5gs.svc.cluster.local
+        n32cPort: 7778
+        n32fPort: 7779
+  sepp:
+    sender: ""
+    ports:
+      n32c: 7778
+      n32f: 7779
+    tls:
+      existingSecret: sepp-tls
+      ca: ""
+      cert: ""
+      key: ""
+      verifyClient: true
+  pcf:
+    policy: []
+
+resources: {}

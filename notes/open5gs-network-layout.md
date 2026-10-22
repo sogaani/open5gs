@@ -1261,7 +1261,177 @@ Open5GS 側:
 
 ---
 
-## 11. 参考
+## 11. ローミング (SEPP / Home-Routed) でフル MVNO を模擬する
+
+### 11.1 構成
+
+フル MVNO = 自前の PLMN (999/71) と加入者 DB を持ち、MNO (999/70) の RAN と AMF を借りる事業者。
+3GPP ではそのまま「V-PLMN = MNO、H-PLMN = MVNO の Home-Routed (HR) ローミング」になる。
+
+```
+ namespace open5gs (MNO, V-PLMN 999/70)             namespace mvno (MVNO, H-PLMN 999/71)
+ ┌──────────────────────────────────────────┐      ┌──────────────────────────────────────────┐
+ │ gNB ──N2── AMF ──SBI── SCP ── NRF        │      │  NRF ── SCP ──SBI── AUSF / UDM / UDR     │
+ │  │          │           │                │      │          │          PCF / NSSF / BSF      │
+ │  │          │        SEPP ═══ N32-c/f ═══╪══════╪═══ SEPP  │                                │
+ │  │          │        (7778/7779, TLS)    │      │          └──── H-SMF (smf-internet)      │
+ │  │       V-SMF (smf-internet-sst1 ...)   │      │                 │ N4                      │
+ │  │          │ N4                         │      │              H-UPF (10.50.0.0/16, NAT)    │
+ │  └─N3── V-UPF ══════ N9 (GTP-U, Pod IP) ═╪══════╪════════════════┘                          │
+ └──────────────────────────────────────────┘      └──────────────────────────────────────────┘
+```
+
+* MVNO に置くもの: NRF、SCP、SEPP、AUSF、UDM、UDR、PCF、BSF、NSSF、H-SMF、H-UPF、MongoDB、WebUI
+  (`helm/open5gs-mvno`)。
+* MNO に残るもの: gNB、AMF、NRF、SCP、SEPP、V-SMF、V-UPF、V-PCF、NSSF、BSF (`helm/open5gs` の
+  `roaming.enabled: true`)。**V-SMF/V-UPF は HR ローミングでも必須** (N16 で H-SMF、N9 で H-UPF につなぐ)。
+* 制御信号は SBI → SCP → SEPP → (N32) → SEPP → SCP → NF と流れる。N9 (GTP-U) は V-UPF と H-UPF の
+  Pod IP 同士で直接。SEPP を通らない。
+
+### 11.2 Open5GS がローミングと判定する条件
+
+* AMF は SUCI の PLMN (= UE のホーム PLMN) が **serving PLMN リスト**に無ければローミング扱いにする
+  (`lib/sbi/context.c` `ogs_sbi_plmn_id_in_vplmn()`)。serving PLMN は `nrf.serving.plmn_id` に設定し、
+  NRF 登録応答で全 NF に配られる。チャートは以前から `nrf.serving` を出しているので、999/71 の SUCI は
+  何もしなくてもローミング扱い (SEPP が無いと `No SEPP` で失敗するだけ)。
+* AMF のログ `Home-Routed Roaming` / `Local Breakout` で判別。HR と LBO は加入者データの
+  `slice.session.lbo_roaming_allowed` で決まる (未設定 = HR)。
+* AMF は `access_control` に列挙したホーム PLMN の加入者だけ受け入れる (`roaming.peers[]` から生成)。
+
+### 11.3 SEPP に向く条件 = 3GPP 形式の FQDN
+
+NF がリクエストを SEPP に送るのは、**宛先 apiRoot のホストが `<label>.5gc.mnc<MNC3>.mcc<MCC3>.3gppnetwork.org`
+で、その PLMN が serving PLMN と違うとき**だけ (`lib/sbi/path.c`、`src/scp/sbi-path.c`)。IP や k8s の
+Service 名を advertise していると SEPP を経由せず直接接続しようとして失敗する。
+
+* したがって相手 PLMN から到達される NF はこの形式を advertise する:
+  H-PLMN: NRF、AUSF、UDM、NSSF、SMF。V-PLMN: NRF と SMF (H-SMF からのコールバック先)。
+  `advertise: <fqdn>:7777` とポートを付ける (無いと 80 になる)。
+* ラベル部分は自由 (パースは末尾の `mncXXX.mccYYY` だけ) なので、チャートはコンポーネント名を
+  そのまま使う: `smf-internet-sst1.5gc.mnc070.mcc999.3gppnetwork.org`。
+* **advertise のホスト名は NF 起動時に `ogs_addaddrinfo()` + assert で解決される**
+  (`lib/sbi/context.c`)。SCP も同一 PLMN 宛の Target-apiRoot を解決し、AMF は NSSF が返す NRF URI に
+  直接接続する。そこで対象 Service の ClusterIP を固定し (`roaming.fqdnNfs`、`dnns[].clusterIP`)、
+  全 NF Pod に `hostAliases` を注入している (CoreDNS の rewrite でも代替可)。
+* 例外 (重要): 相手 PLMN の NF を指す apiRoot は **NF インスタンスの FQDN からポート無しで作られる**
+  ことがある。V-NRF が合成する `nrf.<domain>` (`ogs_nrf_fqdn_from_plmn_id()`)、V-AMF が V-SMF に渡す
+  `hSmfUri` (`http://smf-internet.5gc.mnc071...` → H-SCP が 80 番に接続してタイムアウトした) など。
+  チュートリアルの設定が全部ポート無し (= 80) なのはこのため。チャートでは 3GPP FQDN を advertise する
+  Service すべてに 80→7777 を追加して吸収している。NRF のラベルは `nrf` 固定。
+
+### 11.4 SEPP の設定
+
+```yaml
+sepp:
+  default: { tls: { server: {private_key, cert, verify_client, verify_client_cacert},
+                    client: {cacert, client_private_key, client_cert} } }
+  sbi:  { server: [{address: __POD_IP__, port: 7777, advertise: <k8s FQDN>}], client: {scp: [...]} }
+  n32:
+    server:
+      - sender: open5gs-sepp.open5gs.svc.cluster.local   # 自分の N32 識別子
+        scheme: https
+        address: __POD_IP__
+        port: 7778                                      # N32-c
+        n32f: { scheme: https, address: __POD_IP__, port: 7779 }
+    client:
+      sepp:
+        - receiver: mvno-sepp.mvno.svc.cluster.local    # 相手の sender と完全一致が必要
+          uri: https://mvno-sepp.mvno.svc.cluster.local:7778
+          n32f: { uri: https://mvno-sepp.mvno.svc.cluster.local:7779 }
+```
+
+* `sender`/`receiver` は N32-c の `SecNegotiateReqData.sender` で交換され、受信側は
+  `sepp_node_find_by_receiver()` で完全一致検索する。TLS の SNI とは無関係。証明書の CN/SAN は
+  `uri` のホストと一致させる (`helm/sepp-certs/make-certs.sh`)。
+* 相手 SEPP がどの PLMN を担当するかは N32-c で相手が送ってくる serving PLMN から学ぶ。
+  そのため各 SEPP は先に自 PLMN の NRF に登録されている必要がある。
+* セキュリティ能力は TLS のみ (PRINS 無し)。
+* 既知の挙動: 相手が先に接続してきて、こちらがまだ NRF 登録前だと
+  `Assertion 'OGS_FSM_STATE(&sepp_node->sm)' failed` で一度落ちて再起動する。再起動後は確立する。
+* 既知の挙動 2: N16 の作成がタイムアウトすると、UE の再送時に V-SMF が
+  `Assertion 'sess->pdu_session_resource_uri'` で落ちる。その後 AMF に古い SM コンテキストが残り、
+  再登録時に SMF からの 404 を受けて `5GS services not allowed` で拒否し続ける。AMF の再起動で解消。
+* 成功ログ: `[<receiver>] SEPP established`。
+
+### 11.5 HR ローミングのデータパス
+
+1. UE (hplmn 999/71) が MNO gNB に登録 → V-AMF がローミング判定 → AUSF/UDM の探索に
+   target-plmn-list を付けて V-NRF → (V-SCP → V-SEPP → H-SEPP → H-SCP) → H-NRF → H-AUSF/H-UDM。
+2. PDU セッション: V-AMF が V-NSSF → H-NSSF (SEPP 越し) → H-NRF で H-SMF を見つけ、V-NRF で
+   S-NSSAI + DNN から V-SMF を選ぶ。V-SMF に `hSmfUri` を渡す。
+3. V-SMF が V-UPF を確保し、N16 (`PduSessionCreateData`) を H-SMF へ (SEPP 越し)。
+   `vsmfPduSessionUri` にはコールバック先として V-SMF の 3GPP FQDN が入る。
+4. H-SMF/H-UPF が UE IP を MVNO のプール (10.50.0.0/16) から払い出し、`hcnTunnelInfo` (H-UPF の
+   GTP-U アドレス = Pod IP) を返す。V-UPF ↔ H-UPF の N9 は Pod IP 同士の GTP-U。
+5. UE の上り: gNB → V-UPF → N9 → H-UPF → ogstun → MASQUERADE (H-UPF Pod IP) → インターネット。
+   MVNO 側で「自網の加入者」として課金・ポリシーを扱える。
+
+DNN 名は両 PLMN に必要 (V-SMF の選択も DNN で行う)。H-SMF の `info` に `tai` を書くと
+V-PLMN の TAI と一致しないので書かない。V-PCF には UDR データが無いので `pcf.policy` に
+加入者 SUPI 範囲のローカルポリシーを持たせる (AM ポリシー用。SM ポリシーは H-PCF)。
+
+### 11.6 H-PLMN 宛の通信で「誰が・何をもとに・何を判断するか」
+
+| 順 | モジュール | 判断材料 | 判断・動作 |
+|---|---|---|---|
+| 1 | V-AMF | SUCI の PLMN と、NRF 登録時に配られた serving PLMN リスト | `ogs_sbi_plmn_id_in_vplmn()` が真ならローミング加入者。`access_control` に無い PLMN は拒否 |
+| 2 | V-AMF | ローミング判定 | AUSF/UDM/NSSF/SMF の探索に `target-plmn-list`(ホーム)と `requester-plmn-list`(自網)を付ける |
+| 3 | V-SCP | 探索ヘッダ | V-NRF に転送するだけ。PLMN は見ない |
+| 4 | V-NRF | `nrf.serving` と `target-plmn-list` | 自 PLMN に一致が無ければ H-NRF へ転送。URI は `hnrf-uri` があればそれ、無ければ `nrf.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` を合成。NRF は SCP を持たないので登録済みの SEPP に直接送る |
+| 5 | V-SEPP | `3gpp-Sbi-Target-apiRoot` の FQDN 末尾 (`mncXXX.mccYYY`) | 他 PLMN → MCC/MNC を切り出し `sepp_node_find_by_plmn_id()` で相手 SEPP を選び N32-f で送る。相手の PLMN は N32-c で相手が申告した serving PLMN から学習 |
+| 6 | H-SEPP | Target-apiRoot の PLMN が自分と同じ | 内向き要求として自分の SCP に渡す |
+| 7 | H-SCP | Target-apiRoot (自 PLMN) | ホスト名を OS リゾルバ (hostAliases) で解決して NF に接続。**3GPP FQDN を実際に解決するのはここだけ** |
+| 8 | H-NRF | `requester-plmn-list`、serving PLMN | 自 PLMN のプロファイルを返す (各 NF が advertise した 3GPP FQDN 入り) |
+| 9 | V-AMF | 加入者データの `lbo_roaming_allowed` | 未設定 = Home-Routed。V-NSSF/H-NSSF 経由で H-SMF を探し、V-NRF で V-SMF を選んで `hSmfUri` を渡す |
+| 10 | V-SMF | `SmContextCreateData` に `hSmfUri` があるか | あれば HR の V-SMF。V-UPF を確保して N16 を `hSmfUri` へ (経路は 5→6→7) |
+| 11 | H-SMF | N16 の `vsmfPduSessionUri`、`vcnTunnelInfo` | H-UPF で UE IP を払い出し `hcnTunnelInfo` を返す。以後のコールバックは `vsmfPduSessionUri` 宛 |
+| 12 | V-UPF / H-UPF | PFCP で渡された F-TEID | PLMN の概念なし。N9 は Pod IP 同士の GTP-U |
+
+要点:
+
+* ローミングかどうかを判断するのは AMF だけ。SCP と SEPP は UE を知らず、ヘッダの FQDN に埋まった PLMN ID
+  だけで「自 PLMN なら解決して接続、他 PLMN なら SEPP へ」を機械的に行う。
+* SEPP は 3GPP FQDN を名前解決しない。SEPP が相手を選ぶ根拠は設定の `receiver` ではなく N32-c で学習した PLMN。
+* NRF が PLMN をまたぐ唯一の「転送者」。ほかの NF は探索結果の apiRoot に従うだけ。
+* V 網内で完結する通信に 3GPP FQDN が要らないのは「PLMN をまたぐ判定が一度も起きないから」。NRF が
+  アドレスを配る仕組み自体はローミングでも同じで、違うのは名前に PLMN ID が埋まっているかどうかだけ。
+* V 側の `roaming.fqdnNfs` が小さいのは、H 側から呼ばれる NF が V-SMF (コールバック) くらいしか無いため。
+  H-UDM → V-AMF の通知も SEPP 経由にしたければ `amf` を追加する。
+
+### 11.7 `nrf.5gc.mnc071.mcc999.3gppnetwork.org` と `hnrf-uri`
+
+* この名前は 3GPP が決めた形式。TS 23.003 28.3.2 がホーム網ドメイン `5gc.mnc<MNC3>.mcc<MCC3>.3gppnetwork.org`
+  を、28.3.2.3.2 が NRF の FQDN `nrf.<ドメイン>` を定める。`3gppnetwork.org` は公開 DNS ではなく GSMA が
+  IPX 向けに運用する私設 DNS 空間 (IR.67)。「PLMN ID が分かれば相手網の NRF の名前が機械的に決まる」のが
+  標準の建付けで、Open5GS の `ogs_nrf_fqdn_from_plmn_id()` (`lib/proto/types.c`) がその実装。
+* `hnrf-uri` は AMF に静的設定するものではなく **NSSF から動的に受け取る**。ローミング時に V-NSSF が H-NSSF に
+  問い合わせ、H-NSSF の `NsiInformation.nrfId` にホーム網の NRF URI が入る (TS 29.531)。Open5GS の
+  `src/amf/nnssf-handler.c` はこれを `sess->nssf.hnrf_uri` に保存し、以後の探索で NRF に渡す。
+  NRF は `hnrf-uri` があればそのホストを、無ければ上の形式で合成した名前を H-NRF として使う。
+* 今回のログで両方が見える: 登録時 (AUSF/UDM 探索、NSSF 未経由) は `hnrf_uri:NULL` で合成、
+  PDU セッション時 (SMF 探索) は `hnrf_uri:http://nrf.5gc.mnc071...:7777/nnrf-disc/v1/nf-instances`。
+* Open5GS に「相手 PLMN → H-NRF URI」を AMF/NRF に書く設定は無い。登録先は **H-PLMN の NSSF の `nsi[].uri`**
+  で、これが `nrfId` として返る。だからこの URI は k8s の Service 名ではなく 3GPP 形式でなければならない
+  (V 側の各ホップが PLMN を判定できる必要がある)。
+* AMF が「事前にローミング先を知っている」に相当するのは `access_control` (受け入れるホーム PLMN) と
+  SEPP の `n32.client.sepp[]` (N32 を張る相手) だけ。どの NF にどう届けるかは PLMN ID から決まる FQDN と
+  NSSF が返す `nrfId` で実行時に解決される。事業者を追加しても全 NF の設定を触らずに済む設計。
+
+### 11.8 UERANSIM に当てたパッチ (`docker/ueransim/patches/`)
+
+| パッチ | 内容 |
+|---|---|
+| 0001 UE PLMN 選択 | `performPlmnSelection()` は HPLMN と Equivalent PLMN しか候補にしないため、999/71 の UE は 999/70 のセルで LIMITED SERVICE 止まりだった。TS 23.122 の自動モード (iv)「禁止されていない他 PLMN」を候補に加える。 |
+| 0002 gNB AMF 選択 | v3.3.0 は Registration Request の Requested NSSAI で AMF を選ぶ。Service Request など NSSAI の無い初期 NAS では `Could not find a suitable AMF` になり、CM-IDLE からの復帰や gNB 再起動後に UE が二度と復帰しなかった。接続中の任意の AMF にフォールバックする。 |
+| 0003 gNB Requested NSSAI | 同じコードが IE 不在時に optional を参照していた (UB)。IE を**削除する動作は維持**する: Open5GS は Initial UE Message の Registration Request に非 cleartext IE (Requested NSSAI など) があると `Non cleartext IEs is included` で拒否する (TS 24.501 4.4.6)。AMF は加入者データのデフォルト S-NSSAI で動く。 |
+
+RAN 共用方式 (gNB が 999/71 を報知し、AMF の tai/plmn_support に 999/71 を追加) でも UE 無改造で
+動くが、UE は自網だと思い込み、AMF が NRF の serving PLMN の都合でローミング扱いにするだけの
+ハイブリッドになる (ホーム側に届く servingNetwork も 999/71)。HR ローミングを忠実に再現するなら UE パッチ方式。
+
+---
+
+## 12. 参考
 
 * Quickstart (tun、NAT、ファイアウォール、加入者登録):
   https://open5gs.org/open5gs/docs/guide/01-quickstart/

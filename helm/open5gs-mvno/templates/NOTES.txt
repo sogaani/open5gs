@@ -1,0 +1,34 @@
+MVNO home PLMN {{ .Values.plmn.mcc }}/{{ .Values.plmn.mnc }} ("{{ .Release.Name }}") deployed to namespace "{{ .Release.Namespace }}".
+
+WebUI (MVNO subscribers)
+  {{- if eq .Values.webui.service.type "LoadBalancer" }}
+  http://{{ .Values.webui.service.loadBalancerIP | default "<LoadBalancer IP>" }}:{{ .Values.webui.service.port }}
+  {{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "open5gs.component" (dict "ctx" . "name" "webui") }} 9999:{{ .Values.webui.service.port }}
+  {{- end }}
+  login: admin / 1423
+
+Subscribers
+  {{ len .Values.subscribers }} subscriber(s) inserted by the post-install Job (existing IMSIs are kept).
+
+SEPP (N32 to the visited PLMN{{ if gt (len .Values.roaming.peers) 1 }}s{{ end }})
+  identity : {{ include "open5gs.seppSender" . }}
+  {{- range .Values.roaming.peers }}
+  peer     : {{ .sepp.host }} (PLMN {{ .mcc }}/{{ .mnc }}) https://{{ .sepp.host }}:{{ .sepp.n32cPort }} / :{{ .sepp.n32fPort }}
+  {{- end }}
+  TLS      : Secret {{ include "open5gs.seppTlsSecret" . }} (ca.crt, tls.crt, tls.key)
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" . "name" "sepp") }} | grep -i "SEPP established\|Retry"
+
+3GPP FQDNs advertised by this PLMN (pinned ClusterIPs, hostAliases in every NF pod)
+  {{- range $nf, $ip := .Values.roaming.fqdnNfs }}
+  {{ include "open5gs.fqdn3gpp" (dict "ctx" $ "name" $nf) }} -> {{ $ip }}
+  {{- end }}
+  {{- range $d := .Values.dnns }}
+  {{ include "open5gs.fqdn3gpp" (dict "ctx" $ "name" (include "open5gs.dnnName" (dict "ctx" $ "prefix" "smf" "dnn" $d))) }} -> {{ $d.clusterIP }}
+  {{- end }}
+
+Roaming UEs are simulated from the MNO chart: set ueransim.ues[].hplmn to {{ .Values.plmn.mcc }}/{{ .Values.plmn.mnc }}
+and use an IMSI from subscribers[] above. Expected UE address: {{ (index .Values.dnns 0).subnet }} via {{ include "open5gs.component" (dict "ctx" . "name" (include "open5gs.dnnName" (dict "ctx" . "prefix" "upf" "dnn" (index .Values.dnns 0)))) }}.
+
+Core status
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}

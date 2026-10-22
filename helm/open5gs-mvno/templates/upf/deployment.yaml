@@ -1,0 +1,91 @@
+{{- $root := . }}
+{{- range $d := .Values.dnns }}
+{{- $name := include "open5gs.dnnName" (dict "ctx" $root "prefix" "upf" "dnn" $d) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $root.Template.BasePath "/upf/configmap.yaml") $root | sha256sum }}
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $d.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: netsetup
+          image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["/bin/sh", "/config/netsetup.sh"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+      containers:
+        - name: upf
+          image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              sed "s/__POD_IP__/${POD_IP}/g" /config/upf.yaml > /tmp/upf.yaml
+              exec open5gs-upfd -c /tmp/upf.yaml
+          env:
+            {{- include "open5gs.podIpEnv" $root | nindent 12 }}
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          ports:
+            - name: pfcp
+              containerPort: 8805
+              protocol: UDP
+            - name: gtpu
+              containerPort: 2152
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+          resources:
+            {{- toYaml $root.Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+{{- end }}

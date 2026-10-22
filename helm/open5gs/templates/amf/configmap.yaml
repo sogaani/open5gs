@@ -19,6 +19,16 @@ data:
         server:
           - address: __POD_IP__
             port: 9090
+      {{- if .Values.roaming.enabled }}
+      # Home PLMNs whose subscribers may register here (own + roaming peers)
+      access_control:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+        {{- range .Values.roaming.peers }}
+        - plmn_id:
+            mcc: {{ .mcc | quote }}
+            mnc: {{ .mnc | quote }}
+        {{- end }}
+      {{- end }}
       guami:
         - {{- include "open5gs.plmnId" . | nindent 10 }}
           amf_id:

@@ -13,4 +13,4 @@ data:
         {{- include "open5gs.sbiServer" (dict "ctx" . "name" "scp") | nindent 8 }}
         client:
           nrf:
-            - uri: http://{{ include "open5gs.fqdn" (dict "ctx" . "name" "nrf") }}:7777
+            - uri: {{ include "open5gs.nrfUri" . }}
