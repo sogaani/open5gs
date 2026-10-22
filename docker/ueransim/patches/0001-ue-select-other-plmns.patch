@@ -1,0 +1,35 @@
+diff --git a/src/ue/nas/mm/radio.cpp b/src/ue/nas/mm/radio.cpp
+index 6cf9b8b..7f2a9d7 100644
+--- a/src/ue/nas/mm/radio.cpp
++++ b/src/ue/nas/mm/radio.cpp
+@@ -93,6 +93,30 @@ void NasMm::performPlmnSelection()
+             candidates.push_back(plmn);
+     }
+ 
++    // Automatic mode, TS 23.122 4.4.3.1.1 step (iv): any other PLMN that is
++    // not forbidden. Without this a UE never camps on a visited PLMN, so
++    // roaming (e.g. a 999/71 UE on a 999/70 cell) is impossible.
++    for (auto &plmn : plmns)
++    {
++        if (plmn == m_base->config->hplmn)
++            continue;
++        if (m_storage->forbiddenPlmnList->contains(plmn))
++            continue;
++        if (nas::utils::ServiceAreaListForbidsPlmn(m_storage->serviceAreaList->get(), nas::utils::PlmnFrom(plmn)))
++            continue;
++        bool alreadyCandidate = false;
++        for (auto &candidate : candidates)
++        {
++            if (candidate == plmn)
++            {
++                alreadyCandidate = true;
++                break;
++            }
++        }
++        if (!alreadyCandidate)
++            candidates.push_back(plmn);
++    }
++
+     Plmn selected = candidates.empty() ? Plmn{} : candidates[0];
+ 
+     if (!selected.hasValue())

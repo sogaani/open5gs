@@ -8,8 +8,15 @@ RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates git make gcc g++ cmake libsctp-dev lksctp-tools && \
     rm -rf /var/lib/apt/lists/*
+# Local fixes on top of the release (see patches/README.md):
+#   0001 UE: also select non-forbidden visited PLMNs (roaming)
+#   0002 gNB: Service Request / non-registration initial NAS reached no AMF
+#   0003 gNB: keep the Requested NSSAI in the Registration Request
+COPY patches/ /patches/
 RUN git clone --depth 1 --branch ${UERANSIM_VERSION} https://github.com/aligungr/UERANSIM.git /UERANSIM && \
-    cd /UERANSIM && make -j"$(nproc)"
+    cd /UERANSIM && \
+    for p in /patches/*.patch; do echo "applying $p" && git apply --verbose "$p"; done && \
+    make -j"$(nproc)"
 
 FROM ubuntu:${UBUNTU_TAG}
 RUN apt-get update && \

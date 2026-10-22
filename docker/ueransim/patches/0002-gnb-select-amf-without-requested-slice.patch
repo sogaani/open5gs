@@ -1,0 +1,43 @@
+diff --git a/src/gnb/ngap/nnsf.cpp b/src/gnb/ngap/nnsf.cpp
+index 84ae615..3181f49 100644
+--- a/src/gnb/ngap/nnsf.cpp
++++ b/src/gnb/ngap/nnsf.cpp
+@@ -13,16 +13,32 @@ namespace nr::gnb
+ 
+ NgapAmfContext *NgapTask::selectAmf(int ueId, int32_t &requestedSliceType)
+ {
+-    for (auto &amf : m_amfCtx) {
+-        for (const auto &plmnSupport : amf.second->plmnSupportList) {
+-            for (const auto &singleSlice : plmnSupport->sliceSupportList.slices) {
+-                int32_t supportedSliceType = static_cast<int32_t>(singleSlice.sst);
+-                if (supportedSliceType == requestedSliceType) {
+-                    return amf.second;
++    // Only a Registration Request carries a Requested NSSAI. Other initial NAS
++    // messages (Service Request, Deregistration Request) arrive with
++    // requestedSliceType == -1; match on the slice only when one was requested.
++    if (requestedSliceType >= 0)
++    {
++        for (auto &amf : m_amfCtx)
++        {
++            if (amf.second->state != EAmfState::CONNECTED)
++                continue;
++            for (const auto &plmnSupport : amf.second->plmnSupportList)
++            {
++                for (const auto &singleSlice : plmnSupport->sliceSupportList.slices)
++                {
++                    int32_t supportedSliceType = static_cast<int32_t>(singleSlice.sst);
++                    if (supportedSliceType == requestedSliceType)
++                        return amf.second;
+                 }
+             }
+         }
+     }
++
++    // No slice requested, or no AMF advertises it: use any connected AMF and
++    // let the core decide (it answers with the proper 5GMM cause).
++    for (auto &amf : m_amfCtx)
++        if (amf.second->state == EAmfState::CONNECTED)
++            return amf.second;
+     return nullptr;
+ }
+ 
