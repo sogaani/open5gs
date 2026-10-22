@@ -91,6 +91,16 @@ spec:
               command: ["/bin/sh", "-c", "ss -lun | grep -q ':4997'"]
             initialDelaySeconds: 5
             periodSeconds: 5
+          # UERANSIM never reconnects after the SCTP association to the AMF is
+          # lost (e.g. the AMF pod was replaced); it just drops the AMF context
+          # and every later UE fails with "Could not find a suitable AMF".
+          # Restart the pod when nr-cli reports no AMF context.
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "nr-cli $(nr-cli --dump | head -1) -e amf-list | grep -q 'id:'"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
           volumeMounts:
             - name: config
               mountPath: /config
