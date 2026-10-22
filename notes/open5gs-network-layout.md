@@ -1431,7 +1431,214 @@ RAN 共用方式 (gNB が 999/71 を報知し、AMF の tai/plmn_support に 999
 
 ---
 
-## 12. 参考
+## 12. Open5GS のコードの読み方 (AMF を起点に)
+
+全 NF が同じ骨格 (設定読込 → SBI 初期化 → NRF 登録 → イベントループ + FSM) を持ち、NF 固有の部分は
+イベントの種類と FSM の中身だけが違う。
+
+### 12.1 ディレクトリと命名規則
+
+| 場所 | 役割 |
+|---|---|
+| `src/main.c` | 全 NF 共通の `main()`。引数処理、`ogs_app_initialize()`、`app_initialize()` (NF 側)、シグナル待ち |
+| `src/<nf>/` | NF 固有コード。AMF は `src/amf/` (約 34,000 行) |
+| `lib/core/` | 基盤: `ogs-fsm` (状態機械)、`ogs-queue`/`ogs-pollset`/`ogs-timer` (イベントループ)、`ogs-pool`、`ogs-hash`、`ogs-list`、`ogs-log` |
+| `lib/app/` | YAML 設定の読込と `global`/`logger` の解釈、`ogs_app()` コンテキスト |
+| `lib/sbi/` | SBI 共通: HTTP/2 サーバ (nghttp2)・クライアント (libcurl)、NRF 登録/探索、OpenAPI メッセージの encode/decode |
+| `lib/nas/5gs/` | NAS メッセージの型と encoder/decoder (生成コード) |
+| `lib/ngap/`, `lib/sctp/` | NGAP ASN.1 (asn1c 生成) と SCTP ソケット |
+| `lib/proto/` | 3GPP 共通型 (PLMN ID、S-NSSAI、GUTI、FQDN 生成など) |
+
+ファイル名の接尾辞:
+
+* `*-build.c`: 送信メッセージの組み立て (`nausf-build.c` = AUSF 向け要求)
+* `*-handler.c`: 受信メッセージの解釈とコンテキスト更新 (`ngap-handler.c`)
+* `*-path.c`: 送受信の経路 (`nas-path.c`、`sbi-path.c`)
+* `*-sm.c`: 状態機械 (`gmm-sm.c` = UE の 5GMM 状態機械)
+* `context.c/.h`: その NF のデータ構造と設定の解釈
+* `n<nf>-*`: その NF が**クライアントとして**呼ぶ相手 (`nudm-handler.c` は UDM からの応答処理)、
+  `namf-*` は AMF が**サーバとして**提供する Namf
+
+### 12.2 起動シーケンス (共通 → 固有)
+
+```
+main()                                  src/main.c
+ └ ogs_app_initialize()                 lib/app/ogs-init.c
+    ├ ogs_core_initialize()             ログ、メモリプール、pollset、timer_mgr、event queue
+    ├ YAML 読込 → logger / global        lib/app/ogs-config.c (global.max.ue → プールサイズ)
+ └ app_initialize()                     src/amf/app.c
+    ├ ogs_sctp_init()                   NGAP 用 SCTP
+    └ amf_initialize()                  src/amf/init.c:33
+       ├ amf_context_init()             AMF のプール (gnb, ran_ue, amf_ue, sess) を確保
+       ├ ogs_sbi_context_parse_config(APP_NAME, "nrf", "scp")   ← 共通: amf.sbi.* を読む
+       ├ amf_context_parse_config()     ← 固有: amf.ngap / guami / tai / plmn_support / access_control
+       ├ amf_sbi_open()                 src/amf/sbi-path.c:26
+       ├ ngap_open()                    SCTP サーバを listen (src/amf/ngap-path.c)
+       └ ogs_thread_create(amf_main)    イベントループを別スレッドで開始
+```
+
+* `ogs_sbi_context_parse_config()` (`lib/sbi/context.c:224`) は全 NF 共通。引数が「`client.nrf` / `client.scp`
+  を読め」という指示で、`sbi.server[]` (bind/advertise/TLS)、`sbi.client`、`default.tls`、`serving` を
+  `ogs_sbi_self()` と `ogs_local_conf()` に格納する。`advertise` の名前解決 (`context.c:912-941`) もここ。
+* `amf_sbi_open()`: `ogs_sbi_nf_instance_build_default()` で自分の NF プロファイルを作り、
+  `ogs_sbi_nf_service_build_default()` で `namf-comm` を足し、NRF/SCP のインスタンスに `ogs_sbi_nf_fsm_init()`
+  で登録 FSM を開始、`ogs_sbi_server_start_all()` で HTTP/2 サーバを起動 (受信は `OGS_EVENT_SBI_SERVER`)。
+
+### 12.3 イベントループと FSM (全 NF 共通の心臓部)
+
+`src/amf/init.c:125` の `amf_main()`:
+
+```c
+ogs_fsm_init(&amf_sm, amf_state_initial, amf_state_final, 0);
+for (;;) {
+    ogs_pollset_poll(pollset, ogs_timer_mgr_next(timer_mgr));  // ソケット I/O 待ち
+    ogs_timer_mgr_expire(timer_mgr);                            // 満了タイマを発火
+    while (ogs_queue_trypop(queue, &e) == OGS_OK)               // 溜まったイベントを
+        ogs_fsm_dispatch(&amf_sm, e);                           // 1 つの FSM に流す
+}
+```
+
+* 単一スレッドのイベント駆動。ソケットの受信コールバック (SCTP、HTTP/2) はパケットを `amf_event_t` に
+  包んでキューに push するだけで、処理はこのループ内。ロックはほぼ無い。
+* イベントは 2 層: 共通 (`OGS_EVENT_SBI_SERVER` / `SBI_CLIENT` / `SBI_TIMER`) と NF 固有
+  (`src/amf/event.h`: `AMF_EVENT_NGAP_MESSAGE`、`NGAP_LO_ACCEPT`、`5GMM_MESSAGE`、`5GSM_MESSAGE`、各タイマ)。
+* トップ FSM は `amf-sm.c:47 amf_state_operational()` 一つで、巨大な `switch (e->h.id)` = 配電盤。
+
+| イベント | 配電先 |
+|---|---|
+| `OGS_EVENT_SBI_SERVER` (HTTP 要求受信) | サービス名 × リソース名 × メソッドで `SWITCH/CASE`。`namf-comm` → `namf-handler.c`、NRF 通知 → `lib/sbi/nnrf-handler.c`、SMF/UDM コールバック → `amf_namf_callback_*` |
+| `OGS_EVENT_SBI_CLIENT` (HTTP 応答受信) | NRF 関連は `nf_instance->sm` か `amf_nnrf_handle_nf_discover()`。それ以外は応答に紐づく `ogs_sbi_xact_t` から `amf_ue`/`amf_sess` を取り出し、`amf_ue->sm` へ dispatch するか `amf_nsmf_pdusession_handle_*` を直接呼ぶ |
+| `OGS_EVENT_SBI_TIMER` | NRF ハートビート、応答待ちタイムアウト (`xact->t_response`) |
+| `AMF_EVENT_NGAP_LO_ACCEPT` / `SCTP_COMM_UP` / `CONNREFUSED` | gNB コンテキストの追加/削除、gNB FSM 初期化 |
+| `AMF_EVENT_NGAP_MESSAGE` | `gnb->sm` (`ngap-sm.c`) → NGAP デコード → `ngap-handler.c` の各手続き |
+| `AMF_EVENT_5GMM_MESSAGE` | NAS デコード、SUCI/GUTI で `amf_ue` を特定/生成 → `amf_ue->sm` (`gmm-sm.c`) |
+| `AMF_EVENT_5GSM_MESSAGE` | UL NAS Transport 内の 5GSM ペイロードを SMF へ転送 |
+
+`SWITCH(str) / CASE("...") / DEFAULT / END` は文字列比較マクロ (`lib/core/ogs-macros.h`)。`strcmp` の連鎖。
+
+### 12.4 共通 SBI ライブラリの読みどころ (`lib/sbi/`)
+
+1. **NF 登録 FSM** `nf-sm.c`: `ogs_sbi_nf_state_will_register` (NFRegister を PUT、失敗時タイマで再試行) →
+   `ogs_sbi_nf_state_registered` (ハートビート PATCH、`t_no_heartbeat` で死活監視)。NRF 応答から serving PLMN や
+   heartbeat_interval を取り込むのは `nnrf-handler.c:53` 付近。
+2. **探索と送信** `path.c`: 入口は `ogs_sbi_discover_and_send(xact)`。既知の NF があれば
+   `ogs_sbi_send_request_to_nf_instance()`、無ければ NRF 探索 (直接 or SCP 委任)。
+   `ogs_sbi_send_request_to_client()` (`path.c:779`) が「SCP があれば SCP へ、宛先が他 PLMN なら SEPP へ」を判定。
+3. **トランザクション** `ogs_sbi_xact_t` (`context.h:275`): どの UE/セッションの、どのサービス宛の要求を、
+   どの状態で待っているかを保持。`build` 関数ポインタを持ち、探索完了後にそれで要求を組み立てる。
+   応答時は xact から元の `amf_ue` と `state` を復元して FSM へ。**非同期処理の継続情報はすべて xact にある**。
+4. **メッセージ** `message.c`: HTTP と OpenAPI モデル (`lib/sbi/openapi/`) の相互変換。
+   `ogs_sbi_message_t` の `h.service.name` / `h.resource.component[]` / `h.method` が分岐キー。
+5. **サーバ/クライアント** `nghttp2-server.c`、`client.c`: I/O 層。`client.c:561` 付近の `CURLOPT_RESOLVE`
+   (`resolve:`) や接続タイマなど運用で効く設定はここ。
+
+AMF 側のラッパが `src/amf/sbi-path.c:97 amf_ue_sbi_discover_and_send()`。ローミング時に `target-plmn-list`
+を付ける処理もここで、「共通ライブラリに NF 固有の判断を注入する」典型例。
+
+### 12.5 AMF 固有の構造 (`src/amf/context.h`)
+
+```
+amf_context_t (amf_self())        設定 + 各プール + ハッシュ (SUCI→amf_ue, GUTI→amf_ue, ...)
+ ├ amf_gnb_t   (context.h:142)    SCTP 接続単位。supported TA list、gNB FSM (ngap-sm.c)
+ │   └ ran_ue_t (context.h:187)   gNB 上の UE コンテキスト (RAN/AMF UE NGAP ID)。N2 接続ごとに生成
+ ├ amf_ue_t    (context.h:346)    NAS 上の UE。SUPI/SUCI/GUTI、セキュリティ文脈、allowed NSSAI、
+ │                                 5GMM FSM (gmm-sm.c)、ran_ue への参照 (切断で外れる)
+ │   └ amf_sess_t (context.h:799) PDU セッション。PSI、S-NSSAI/DNN、SMF の sm-context URI、H-SMF 関連
+```
+
+`ran_ue_t` と `amf_ue_t` が分かれているのが重要。RRC/N2 が切れても `amf_ue` は残り (CM-IDLE)、次の
+Initial UE Message で新しい `ran_ue` に `amf_ue_associate_ran_ue()` で再結合する。ログの
+「Holding NG Context」「Clear NG Context」はこの付け替え。
+
+### 12.6 UE 手続きの流れ (登録を例に)
+
+1. `ngap-sctp.c:123 ngap_recv_handler()` が SCTP から読み、`AMF_EVENT_NGAP_MESSAGE` を push
+2. `amf-sm.c:900` → `gnb->sm` (`ngap-sm.c:40`) → `ngap_handle_initial_ue_message()` (`ngap-handler.c:668`):
+   `ran_ue_add`、TAI/Cell を記録、NAS PDU を `AMF_EVENT_5GMM_MESSAGE` に変換
+3. `amf-sm.c:963`: NAS デコード、SUCI で `amf_ue_find_by_suci()` か `amf_ue_add()`、`amf_ue->sm` へ
+4. `gmm-sm.c:83 gmm_state_de_registered`: `gmm_handle_registration_request()` で検証 (cleartext IE、TAI、
+   Requested NSSAI vs plmn_support、access_control) → `OGS_FSM_TRAN(gmm_state_authentication)` し
+   `amf_ue_sbi_discover_and_send(Nausf_UEAuthentication, ...)` を発行
+5. 応答 → `amf-sm.c:322` → xact → `gmm_state_authentication` (`gmm-sm.c:2119`) で `nausf-handler.c` →
+   Authentication Request を `nas-path.c:468` で送信
+6. 以降 `gmm_state_security_mode` (2751) → `gmm_state_initial_context_setup` (3150: UDM の UECM/SDM、
+   PCF の AM ポリシー、Initial Context Setup Request) → `gmm_state_registered` (898: PDU セッション要求、
+   Service Request、Deregistration)
+
+各状態関数は「`AMF_EVENT_5GMM_MESSAGE` なら NAS の種類で分岐、`OGS_EVENT_SBI_CLIENT` なら xact の `state` で
+分岐、タイマなら再送か諦め」という同じ形。PDU セッションは `gmm-sm.c:1197` 付近の UL NAS Transport →
+`amf_sess_add()` → `amf_sess_sbi_discover_and_send(Nsmf_PDUSession, ...)` → `nsmf-handler.c` →
+`ngap-build.c` の PDU Session Resource Setup。ローミング分岐は `gmm-handler.c:1508-1584`。
+
+### 12.7 FSM とは
+
+FSM = Finite State Machine (有限状態機械)。「対象は常に 1 つの状態にあり、イベントが来ると現在の状態に応じて
+処理し、必要なら別の状態に移る」モデル。登録手続きのような**会話**は各ステップで「次に何が来るべきか」が
+変わるので、状態を名前付きで持ち、状態ごとに「このイベントならこうする」を書く。3GPP 仕様自体が状態
+(5GMM-DEREGISTERED、5GMM-REGISTERED ...) で書かれているのでコードと対応しやすい。
+
+Open5GS の実装 (`lib/core/ogs-fsm.h` / `.c`) は関数ポインタ 3 つだけ:
+
+```c
+typedef void (*ogs_fsm_handler_t)(void *sm, void *event);
+typedef struct {
+    ogs_fsm_handler_t init;   // 最初の状態
+    ogs_fsm_handler_t fini;   // 終了時に呼ぶ関数
+    ogs_fsm_handler_t state;  // 現在の状態 = 関数そのもの
+} ogs_fsm_t;
+```
+
+* **状態 = 関数**。`gmm_state_authentication` のような関数が状態で、`sm->state` にそのアドレスが入る。
+* `ogs_fsm_dispatch(sm, e)` は `(*sm->state)(sm, e)` を呼ぶだけ。
+* 遷移は `OGS_FSM_TRAN(sm, 新状態)` (= `sm->state` への代入)。`ogs_fsm_tran()` 経由だと旧状態に
+  `OGS_FSM_EXIT_SIG`、新状態に `OGS_FSM_ENTRY_SIG` の擬似イベントを配ってから切り替える。状態関数先頭の
+  `case OGS_FSM_ENTRY_SIG:` は入った瞬間 (タイマ開始など)、`EXIT_SIG` は出る瞬間 (タイマ停止など) の処理。
+* `OGS_FSM_CHECK(sm, 状態)` で「今この状態か」を判定。SEPP の `Assertion 'OGS_FSM_STATE(&sepp_node->sm)'`
+  は「FSM 未初期化で state が NULL」の意味。
+
+状態関数の典型形:
+
+```c
+void gmm_state_authentication(ogs_fsm_t *s, amf_event_t *e)
+{
+    switch (e->h.id) {
+    case OGS_FSM_ENTRY_SIG:            /* 状態に入った */            break;
+    case AMF_EVENT_5GMM_MESSAGE:       /* NAS が来た: 種類で分岐 */   break;
+    case OGS_EVENT_SBI_CLIENT:         /* AUSF の応答: 成功なら OGS_FSM_TRAN(s, &gmm_state_security_mode) */ break;
+    case AMF_EVENT_5GMM_TIMER:         /* T3560 満了: 再送 or 諦め */ break;
+    }
+}
+```
+
+AMF 内の FSM の階層:
+
+| FSM | 1 インスタンスの単位 | 状態の例 | ファイル |
+|---|---|---|---|
+| `amf_sm` | プロセスに 1 つ | `amf_state_operational` (配電盤) | `amf-sm.c` |
+| `nf_instance->sm` | NRF/SCP/相手 NF ごと | `will_register` → `registered` | `lib/sbi/nf-sm.c` |
+| `gnb->sm` | SCTP 接続 (gNB) ごと | `ngap_state_operational` / `exception` | `ngap-sm.c` |
+| `amf_ue->sm` | UE ごと | `de_registered` → `authentication` → `security_mode` → `initial_context_setup` → `registered`、`exception` | `gmm-sm.c` |
+
+トップの `amf_sm` がイベントを受け、対象 (gNB や UE) を特定してその FSM に dispatch する入れ子構造。
+状態関数は共有され、`amf_ue->sm.state` は UE ごとに別の値を持つので独立に進む。
+
+### 12.8 読む順番
+
+1. `src/main.c` → `lib/app/ogs-init.c` → `src/amf/app.c` → `src/amf/init.c`
+2. `lib/core/ogs-fsm.h` と `src/amf/event.h`
+3. `src/amf/amf-sm.c` を上から (配電盤の全体像)
+4. `src/amf/context.h` (構造体の関係)
+5. `src/amf/sbi-path.c:26-160`、`lib/sbi/nf-sm.c`、`lib/sbi/path.c:576-800`
+6. `src/amf/ngap-sm.c` → `ngap-handler.c` の `ngap_handle_ng_setup_request` と `ngap_handle_initial_ue_message`
+7. `src/amf/gmm-sm.c` の `gmm_state_de_registered` → `gmm_state_authentication` の順に登録手続きを追う
+8. 必要に応じて `*-build.c` / `*-handler.c` のペア
+
+コツ: 状態関数の一覧 (`grep -n "^void gmm_state_" src/amf/gmm-sm.c`) が仕様書の状態図に相当する。各状態関数内の
+`OGS_FSM_TRAN` を探すと遷移図が描ける。`logger.level: debug` で分岐がログに出る。
+
+---
+
+## 13. 参考
 
 * Quickstart (tun、NAT、ファイアウォール、加入者登録):
   https://open5gs.org/open5gs/docs/guide/01-quickstart/
