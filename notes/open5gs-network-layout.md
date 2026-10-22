@@ -1429,6 +1429,115 @@ RAN 共用方式 (gNB が 999/71 を報知し、AMF の tai/plmn_support に 999
 動くが、UE は自網だと思い込み、AMF が NRF の serving PLMN の都合でローミング扱いにするだけの
 ハイブリッドになる (ホーム側に届く servingNetwork も 999/71)。HR ローミングを忠実に再現するなら UE パッチ方式。
 
+### 11.9 実網ではどう届くか: S-NAPTR ではなく SEPP、IPX、GSMA
+
+Open5GS の N32 は「ピア SEPP を設定で直書き」だが、実網では V-PLMN から H-PLMN へ
+どう経路が決まるのかを整理しておく。
+
+#### EPC と 5GC の違い (S-NAPTR の位置づけ)
+
+| | EPC (TS 29.303) | 5GC SBI (TS 29.500 / 33.501) |
+|---|---|---|
+| H 側ノードの探し方 | MME が `apn.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` を GRX/IPX DNS で S-NAPTR 解決し、H-PGW の IP を得る | 名前 (`nrf.5gc.mnc071.mcc999...`) を得るだけで、V 側は IP を引かない |
+| 越境通信の送り先 | H-PGW の IP へ直接 (IPX は IP 転送) | 自網の V-SEPP。V-SEPP → H-SEPP (N32) → H-SCP/H-NF |
+| H 側内部の名前解決 | V 側 resolver が IPX DNS 経由で行う | H-SEPP / H-SCP が H-PLMN 内部 DNS で行う |
+
+- `.3gppnetwork.org` はインターネットに存在しない私設ドメイン (GSMA IR.67)。ルートを GSMA が
+  指名した事業者が IPX 網上で運用し、各事業者が `mnc<MNC>.mcc<MCC>.3gppnetwork.org` 配下の
+  権威 DNS を IPX 側に公開する。S-NAPTR はこの DNS 上の仕組みで、主に EPC のノード選択に使う。
+- 5GC では「越境かどうか」を **FQDN 内の PLMN ID** で判定し (TS 29.500 6.1.4.3)、越境なら
+  宛先を自網の SEPP に付け替えて本来の宛先を `3gpp-Sbi-Target-apiRoot` に入れる。もう一つの
+  標準手段が **telescopic FQDN** (TS 23.003): `nrf.5gc.mnc071.mcc999...` を
+  `nrf-5gc-mnc071-mcc999.sepp.5gc.mnc070.mcc999.3gppnetwork.org` のように SEPP 配下の名前に
+  書き換え、自網 DNS でそれを V-SEPP に向ける (V 側で TLS 証明書検証を成立させるため)。
+  どちらでも V 側 NF が解決するのは自網 SEPP の名前だけで、IPX DNS に H-PLMN 内 NF の
+  A レコードを置く必要はない。
+- H-SEPP は Target-apiRoot (または telescopic FQDN から復元した元 FQDN) を取り出して
+  H-SCP/H-NF に転送し、`smf-internet.5gc.mnc071...` の解決は H-PLMN 内部 DNS が行う。
+  今回のチャートではこれを hostAliases + 固定 ClusterIP で代用しており、MNO 側は MVNO 内の
+  FQDN を一切解決していない。
+- N9 (V-UPF ↔ H-UPF) は DNS を使わない。H-SMF が N16 応答で H-UPF の IP/TEID を返し、
+  V-UPF はその IP に GTP-U を IPX の IP 網で直接送る。
+
+#### V-SEPP が H-SEPP を知るまでの三段階
+
+1. **PLMN ID → H-SEPP の名前 (計算で決まる)**: GSMA NG.113 が
+   `sepp.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` と形式を定めているので、ディレクトリ
+   サービスは不要。Open5GS が `ogs_nrf_fqdn_from_plmn_id()` で NRF 名を合成するのと同じ発想。
+2. **名前 → IP**: 実網では次の二通りを併用する。
+   - IPX DNS (動的): IPX 網上の `3gppnetwork.org` ルート DNS → PLMN ゾーンの NS/glue →
+     H 事業者の権威 DNS が公開する `sepp.5gc...` の A/AAAA。委譲登録は H 事業者が GSMA 経由で行う。
+   - IR.21 / 二者間の設定交換 (静的): ローミング契約時に H 事業者が IR.21 (RAEX) に SEPP の
+     FQDN/IP、AS 番号、IP レンジ、DNS サーバを記載して渡す。ファイアウォールの許可リストや
+     IREG 試験に使うため、DNS が引けても静的情報は必ず存在する。
+3. **IP → 経路 (BGP)**: 得られた IP 宛のパケットを V 事業者 → V 側 IPX → (ピアリング) →
+   H 側 IPX → H 事業者 と BGP の経路表で転送する。段階 2 の DNS サーバへの到達性も同じ経路に依存する。
+
+BGP は「どのプレフィクスへどの隣接 AS 経由で行けるか」しか教えない。H-SEPP の IP そのものは、
+H 事業者自身が DNS ゾーンと IR.21 に公開したものを V 側が引くか設定するかして知る。
+インターネットと同じ仕組みで、違いは (a) DNS ツリーが IPX 網内の私設ツリー、(b) 名前が
+PLMN ID から導出できるので「相手の名前を知る」段階が不要、の二点。
+
+N32-c のハンドシェイク先は上の手順で知る必要があるが、N32-f の宛先は N32-c の中で相手が
+教えることもできる (TS 29.573 `SecNegotiateReqData` の `senderN32fFqdn` / `senderN32fPort`、
+Rel-17)。その FQDN もやはり IPX DNS で解決する。
+
+#### IPX 網: BGP で相互接続された私設インターネット
+
+- 事業者 ↔ IPX 事業者: 事業者は IPX 向けプレフィクス (SEPP、UPF、DNS、DEA など) を BGP
+  (小規模なら静的) で広告する。RIR 登録済みの公的 IP を使うがインターネットには広告しない
+  (IR.34 は NAT なしの公的アドレスを要求)。
+- IPX 事業者 ↔ IPX 事業者: GSMA が定める IPX ピアリングポイントで eBGP ピアリングし、顧客
+  事業者のプレフィクスを互いに広告する。経由する IPX 事業者は最大 2 社 (IR.34)。
+- 検証: 各事業者が IR.21 に AS 番号・IP レンジ・DNS・SEPP を登録し、IPX 事業者はそれで
+  BGP のプレフィクスフィルタを作る。
+- IPX プロキシは IP ルータではなくアプリケーションゲートウェイで、宛先はメッセージ内の
+  識別子で決める:
+
+| プロトコル | IPX プロキシ | 宛先の決め方 |
+|---|---|---|
+| Diameter (S6a など) | DEA/DRA | `Destination-Realm` を見て、IR.21 や NAPTR から作った realm ルーティング表で次ホップを選ぶ |
+| GTP (S8/N9) | なし (IP 転送) | IP 経路表そのもの |
+| N32-f PRINS (TS 33.501 13.2.4, TS 29.573) | HTTP プロキシ | Request URI の受信側 SEPP FQDN の PLMN ID から H 側 IPX / H-SEPP を選び IPX DNS で解決。送信側 SEPP には自分の IPX プロキシが設定値として与えられる。N32-c は IPX を介さず end-to-end |
+| N32 TLS 直結 | なし (TCP/IP 転送) | V-SEPP が H-SEPP FQDN を IPX DNS で解決し直接到達 |
+| ローミングハブ | ハブ事業者の SEPP | ハブが両 PLMN と N32 を張り、PLMN ID をキーにした転送表で振り分ける |
+
+事業者が SEPP や DNS のホスティングを IPX 事業者に委託している場合は、委譲先が IPX 側の
+サーバになり「解決したアドレスが IPX プロキシ」になる。ただしその IPX が H-SEPP の役割を
+担っているので、V-SEPP から見れば相手 SEPP と変わらない。Open5GS は PRINS 未実装で TLS 直結のみ。
+
+#### GSMA とは
+
+GSM Association。1995 年設立の移動体通信事業者の業界団体 (本部ロンドン、MWC の主催団体)。
+3GPP との役割分担:
+
+| | 3GPP | GSMA |
+|---|---|---|
+| 性格 | 標準化団体 | 事業者の業界団体 |
+| 決めるもの | プロトコルと手順 (TS 23/29/33.xxx) | 事業者間の運用ルール、契約の枠組み、相互接続ガイドライン |
+| 例 | SEPP の機能、N32 メッセージ、FQDN 形式 (TS 23.003) | `.3gppnetwork.org` ルート DNS の運営、IPX 要件、IR.21 の様式 |
+
+ここまでに出てきた GSMA 文書:
+
+- **IR.21 (RAEX IR.21)**: ローミングに必要な技術情報の台帳 (PLMN ID、AS 番号、IP レンジ、DNS、SEPP の FQDN/IP)。
+- **IR.34**: IPX 網の要件 (公的 IP、NAT なし、経由 IPX 最大 2 社、ピアリングポイント)。
+- **IR.67**: `.3gppnetwork.org` の DNS/ENUM ガイドライン。
+- **NG.113**: 5GS ローミングガイドライン (SEPP FQDN 形式、TLS/PRINS の選択、ローミングハブ)。
+- **IREG**: 元は作業部会名で、転じて事業者間のローミング相互接続試験を指す。
+
+3GPP 文書は無償公開だが、GSMA の IR/NG 系文書は多くが加盟者向け。
+
+#### Open5GS / 今回のチャートとの対応
+
+| 標準の要素 | Open5GS の実装 |
+|---|---|
+| FQDN の PLMN ID で越境判定 | `ogs_sbi_fqdn_in_vplmn()` (`lib/sbi/context.c`) |
+| SEPP へ送り Target-apiRoot ヘッダ付与 | `lib/sbi/path.c`、`src/scp/sbi-path.c` |
+| H-SEPP の発見 (IPX DNS / IR.21) | 設定のみ: `n32.client.sepp[].uri` のホスト名を起動時に `getaddrinfo()` で解決、`resolve:` で IP 直書き。PLMN との対応は N32-c で学習 (`sepp_node_find_by_plmn_id`) |
+| H-SEPP での転送先選択 | `src/sepp/sbi-path.c` で Target-apiRoot の PLMN を見て自 PLMN なら SCP、他 PLMN なら対応 SEPP へ |
+| BGP / IPX 網 | クラスタ網 (Cilium) の固定経路 |
+| telescopic FQDN / PRINS / Diameter DRA | 未実装・存在しない |
+
 ---
 
 ## 12. Open5GS のコードの読み方 (AMF を起点に)
