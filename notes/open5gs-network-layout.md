@@ -1102,7 +1102,11 @@ kubectl -n open5gs exec <gnb-pod> -- sctp_test -H 0.0.0.0 -P 0 -h <amf-pod-ip> -
 UERANSIM v3.3.0 では使える (v3.2.x は IP 文字列のみ)。
 
 * gNB の `amfConfigs[].address`、`linkIp` / `ngapIp` / `gtpIp` は `GetIpAddress()` (`src/utils/yaml_utils.cpp`) で
-  「FQDN を `getaddrinfo` で解決 → IP → インターフェース名」の順に解釈される。`eth0` と書けば Pod IP になる。
+  「FQDN を `getaddrinfo` で解決 → IP → インターフェース名」の順に解釈される。FQDN と IP は使える。
+  ただし **インターフェース名 (`eth0`) は v3.3.0 では動かない**: 先に呼ばれる `TryResolveHost()` が
+  解決失敗時に値を空文字で上書きするため、後続のインターフェース検索が空文字を受け取り
+  `Field 'linkIp' must be a valid IP address...` で起動に失敗する。bind アドレスは downward API の
+  Pod IP を `__POD_IP__` に sed で埋める方式にしている。
   `gtpAdvertiseIp` で bind する IP と AMF に通知する GTP-U アドレスを分けることもできる。
 * UE の `gnbSearchList` は文字列のまま保持され、`InetAddress(name, 4997)` のコンストラクタが `getaddrinfo` を
   呼ぶ (`src/utils/network.cpp`) ので FQDN でよい。
@@ -1112,7 +1116,152 @@ UERANSIM v3.3.0 では使える (v3.2.x は IP 文字列のみ)。
 
 ---
 
-## 10. 参考
+## 10. スライス (S-NSSAI / SST) と SMF・UPF の選択
+
+### 10.1 SST とは
+
+S-NSSAI = SST (Slice/Service Type、1 バイト) + 任意の SD (Slice Differentiator、24 bit)。
+標準値は 1=eMBB、2=URLLC、3=MIoT、4=V2X、128〜255 は事業者独自。
+Open5GS も UERANSIM も SST の「意味」は解釈しない。QoS や経路を直接変えることはなく、
+**「どの UE が、どの gNB 経由で、どの SMF/UPF に接続できるか」を照合するタグ**として働く。
+
+### 10.2 Open5GS で SST が照合される 4 か所
+
+| 場面 | 照合する相手 | 不一致のときの挙動 | コード |
+|---|---|---|---|
+| gNB ↔ AMF (NG Setup) | gNB が広告するスライス vs `amf.plmn_support.s_nssai` | 1 つも一致しないと NG Setup Failure | `src/amf/ngap-handler.c` `s_nssai_is_found()` |
+| UE 登録 (Registration) | UE の Requested NSSAI、UDM から得た加入者データ (`slice[].sst`)、`amf.plmn_support` の共通部分 = Allowed NSSAI | 共通部分が空なら `No Allowed-NSSAI` で登録拒否 | `src/amf/nudm-handler.c` `amf_update_allowed_nssai()` |
+| PDU セッション確立 | UE が送る S-NSSAI + DNN vs 加入者データの `slice[].session[].name` と Allowed NSSAI | 一致するスライスがなければセッション拒否 | `src/amf/gmm-handler.c` (UL NAS Transport) |
+| SMF 選択 | AMF が NRF に S-NSSAI + DNN で検索 vs SMF の `info.s_nssai[].sst` と `dnn` | SST の違う SMF は候補にならない | `lib/sbi/context.c` `ogs_sbi_check_smf_info_slice()` |
+
+Helm チャートでは次の 3 つの値を同じにしておく必要がある。
+
+* `slices[].sst` → AMF `plmn_support`、NSSF、gNB `slices`、SMF `info` に展開 (ネットワーク側)
+* `subscribers[].sst` → MongoDB の加入者データ `slice[0].sst` (`default_indicator: true`)
+* `ues[].sst` → UERANSIM の `sessions[].slice`、`configured-nssai`、`default-nssai`
+
+### 10.3 「同じ DNN 名で SST が違うとき、別の UPF に振り分けられるか」
+
+**SMF を分ければできる。1 つの SMF の中ではできない。**
+
+1 つの SMF 内の UPF 選択は `src/smf/context.c` の `compare_ue_info()` で行われ、照合キーは
+`dnn`、`tac`、`e_cell_id` (4G)、`nr_cell_id` (5G) の 4 つだけ。S-NSSAI は見ていない。
+同じ DNN 名の UPF が 2 つあるとどちらも一致するので、ラウンドロビンで選ばれる。
+一致する UPF がない場合は `global.parameter.no_pfcp_rr_select` を立てない限り他の UPF に
+フォールバックするので、分離を厳密にしたいときはこの設定を有効にする。
+
+一方 AMF → SMF の選択は S-NSSAI + DNN で行われるので、SMF の `info` を分ければ同じ DNN 名でも
+SST ごとに別の SMF、したがって別の UPF に到達する。
+
+```yaml
+# smf-a (upf-a を持つ)
+smf:
+  info:
+    - s_nssai:
+        - sst: 1
+          dnn: [internet]
+  pfcp:
+    client:
+      upf:
+        - address: upf-a
+          dnn: internet
+
+# smf-b (upf-b を持つ)
+smf:
+  info:
+    - s_nssai:
+        - sst: 2
+          dnn: [internet]
+  pfcp:
+    client:
+      upf:
+        - address: upf-b
+          dnn: internet
+```
+
+同時に必要な設定:
+
+* `amf.plmn_support.s_nssai` と gNB の `slices` に SST 1 と 2 の両方を入れる。
+* 加入者データの `slice[]` で、その UE に許可する SST を分ける。SST 2 で `internet` を使う UE には
+  `sst: 2` の slice に `session[].name: internet` が必要。
+* UERANSIM の UE 設定で `sessions[].slice.sst` を使い分ける。
+* UE の IP プール (`session.subnet`) は SMF ごとに持つので、SST 1 と SST 2 で別サブネットにする
+  (必須ではないが推奨。理由は 10.6)。
+
+### 10.4 これは 3GPP 標準の制約か、Open5GS の制約か
+
+**Open5GS の実装上の制約。** 標準では SMF 内の UPF 選択に S-NSSAI を使うことが明確に規定されている。
+
+* TS 23.501 6.3.3 (UPF 選択): S-NSSAI、DNN、UE の位置 (TAI)、UPF の能力、負荷、PDU セッションタイプ
+  などが選択基準として列挙されている。
+* TS 29.510 (NRF): UPF の NF プロファイルに `upfInfo.sNssaiUpfInfoList[]` があり、その中に
+  `dnnUpfInfoList[]` が入る。「この UPF は SST 1 の internet と SST 2 の internet を担当する」と登録し、
+  SMF が S-NSSAI + DNN で UPF を検索する設計。
+* TS 23.501 6.3.2 (SMF 選択): AMF が S-NSSAI + DNN で SMF を選ぶ。こちらは Open5GS も
+  `smfInfo.sNssaiSmfInfoList` として実装している。
+
+Open5GS が省略している部分:
+
+* UPF は NRF に登録されず、SMF は `pfcp.client.upf` の静的リストから選ぶ。
+* その静的リストの照合キーに S-NSSAI がない (`compare_ue_info()`)。
+* UPF 側の `session` 設定も DNN 単位で、S-NSSAI 単位の IP プールは持てない。
+
+商用コアや free5GC のように NRF ベースの UPF 選択を持つ実装では、1 つの SMF がスライスごとに
+別の UPF へ振り分けられる。
+
+### 10.5 MVNO 検証への含意
+
+フル MVNO が自前の SMF と UPF をセットで持ち込む構成は、Open5GS の制約と標準の両方に合う。
+AMF から見れば S-NSSAI + DNN で MVNO の SMF が選ばれ、その先の UPF は MVNO 側で閉じるからである。
+「SST だけで分けて SMF を MNO と共用する」構成だけが Open5GS では再現できない。
+
+チャートでは `dnns[]` の各エントリに任意の `sst` (と `sd`) を持たせられる。
+
+* `sst` なし: `smf-<dnn>` / `upf-<dnn>`。SMF `info` には `values.slices` の全 S-NSSAI を広告 (従来どおり)。
+* `sst` あり: `smf-<dnn>-sst<N>[-sd<hex>]` / `upf-<dnn>-sst<N>[-sd<hex>]`。SMF `info` にはその S-NSSAI だけを
+  広告するので、同じ DNN 名でもスライスごとに別の SMF/UPF ペアに到達する。
+* `sst`/`sd` が `values.slices` にない場合は `helm template` 時点で fail させている (AMF が拒否するため)。
+* 加入者 (`subscribers[].sst`) と UE (`ueransim.ues[].sst`) 側も対応する SST にする。
+
+```yaml
+slices: [{ sst: 1 }, { sst: 2 }]
+dnns:
+  - { name: internet, sst: 1, subnet: 10.45.0.0/16, gateway: 10.45.0.1 }   # MNO
+  - { name: internet, sst: 2, subnet: 10.46.0.0/16, gateway: 10.46.0.1 }   # MVNO
+```
+
+### 10.6 UPF が異なれば UE サブネットも分けなければならないか
+
+**原理的にはどちらの制約でもない。分けるのは IP ルーティングと一部の実装上の都合。**
+
+3GPP 側 (TS 23.501 5.8.2.2 IP address management、TS 29.244 Network Instance IE):
+
+* UE の IP は PDU セッション単位で SMF (または UPF / 外部 DHCP・AAA) が払い出す。プールは DNN + S-NSSAI に紐づく。
+* **異なる DN (Network Instance) の間では IP 空間の重複が明示的に許される。** PFCP の Network Instance IE は
+  まさに「同じアドレス帯を別の VRF/DN で使う」ための識別子。
+* 同じ DN に複数の UPF をぶら下げる場合、UE 宛の下り方向パケットをどの UPF に届けるかを DN 側のルータが
+  判断する必要があるため、UE アドレスを DN にそのまま広報する (NAT しない) 構成では UPF 間で重複できない。
+  これはプロトコルの制約ではなく IP ルーティングの要請。UPF で NAT するなら UE IP は DN に出ないので重複できる。
+
+Open5GS 側:
+
+* SMF / UPF のプールはプロセス内でしか管理されない。重複チェック (`ogs_pfcp_check_subnet_overlapping()`)
+  は 1 プロセス内の同じ DNN の `session` 同士にしかかからず、別 SMF・別 UPF との調整は一切ない。
+  つまり「重複してもよい」のではなく「重複を知らない」。
+* k8s では UPF Pod ごとに netns が分かれ、`ogstun` と MASQUERADE も Pod 単位なので、重複プールでも
+  IP レベルでは動く (上りは各 Pod IP に NAT、下りは TEID で振り分け)。全 NF を 1 ホストに置く VM 構成では
+  `ogstun` が同じ経路表に乗るので重複できない。これはホスト側の制約。
+* **BSF は PCF バインディングを UE IPv4 だけでハッシュしている** (`src/bsf/context.c`
+  `bsf_sess_find_by_ipv4addr()`)。TS 29.521 では ipv4Addr + dnn + snssai + ipDomain で引けるが、Open5GS は
+  IP 単独。スライス間で同じ UE IP が出ると BSF のバインディング表が衝突する。影響するのは AF
+  (IMS の P-CSCF など) が UE IP から PCF を引く経路だけで、単純なインターネット接続には影響しない。
+
+結論: チャートでは `dnns[]` エントリごとに別サブネットを推奨する。必須ではないが、BSF の衝突を避けられ、
+ログやキャプチャの UE IP からスライスを特定できる。
+
+---
+
+## 11. 参考
 
 * Quickstart (tun、NAT、ファイアウォール、加入者登録):
   https://open5gs.org/open5gs/docs/guide/01-quickstart/

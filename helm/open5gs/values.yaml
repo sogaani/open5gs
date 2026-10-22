@@ -38,19 +38,32 @@ slices:
     # sd: "000001"
 
 # ---------------------------------------------------------------------------
-# Data networks: one entry per DNN. Every DNN gets its own SMF (smf-<dnn>) and
-# UPF (upf-<dnn>). Each SMF advertises only its DNN to the NRF, so the AMF
-# selects the SMF by DNN, like an MVNO SMF/UPF attached to an MNO core.
-# UE subnets must not overlap the pod CIDR, the service CIDR or the node LAN.
+# Data networks: one entry per (DNN, optional S-NSSAI). Every entry gets its
+# own SMF and UPF pair. Each SMF advertises only its DNN to the NRF, so the AMF
+# selects the SMF by S-NSSAI + DNN, like an MVNO SMF/UPF attached to an MNO core.
+#   - without sst: smf-<dnn> / upf-<dnn>, SmfInfo lists every entry of slices[]
+#   - with sst:    smf-<dnn>-sst<N>[-sd<hex>] / upf-..., SmfInfo lists only that
+#                  S-NSSAI (it must appear in slices[]), so the same DNN name can
+#                  be served by different SMF/UPF pairs per slice.
+# Open5GS cannot split UPFs by S-NSSAI inside one SMF (it matches UPFs by dnn,
+# tac and cell id only), which is why the split happens at the SMF.
+# UE subnets must not overlap the pod CIDR, the service CIDR or the node LAN,
+# and should be distinct per entry (the BSF keys PCF bindings by UE IPv4 only).
 # ---------------------------------------------------------------------------
 dnns:
   - name: internet
     subnet: 10.45.0.0/16
     gateway: 10.45.0.1
+    # sst: 1            # serve this DNN only for S-NSSAI sst 1 (names become *-internet-sst1)
+    # sd: "000001"      # optional, together with sst
     # nodeSelector: { kubernetes.io/hostname: node-a }   # pin this DNN's SMF and UPF to a node
-  # - name: ims
+  # - name: internet    # same DNN name, different slice -> separate SMF/UPF (smf-internet-sst2)
+  #   sst: 2
   #   subnet: 10.46.0.0/16
   #   gateway: 10.46.0.1
+  # - name: ims
+  #   subnet: 10.47.0.0/16
+  #   gateway: 10.47.0.1
 
 dns:
   - 8.8.8.8

@@ -1,6 +1,6 @@
 {{- $root := . }}
 {{- range $d := .Values.dnns }}
-{{- $name := printf "upf-%s" $d.name }}
+{{- $name := include "open5gs.dnnName" (dict "ctx" $root "prefix" "upf" "dnn" $d) }}
 ---
 # PFCP endpoint used by the SMF. GTP-U goes straight to the pod IP that the
 # UPF reports to the SMF, so it is not exposed through this Service.

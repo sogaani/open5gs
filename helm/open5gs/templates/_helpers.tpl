@@ -78,6 +78,56 @@ plmn_id:
 {{- end }}
 {{- end -}}
 
+{{/*
+Resource name of a per-DNN NF: (dict "ctx" . "prefix" "smf" "dnn" <dnns[] entry>)
+  smf-<dnn>                  when the entry has no sst
+  smf-<dnn>-sst<N>           when the entry has sst
+  smf-<dnn>-sst<N>-sd<hex>   when the entry has sst and sd
+*/}}
+{{- define "open5gs.dnnName" -}}
+{{- $d := .dnn -}}
+{{- if hasKey $d "sst" -}}
+{{- if $d.sd -}}
+{{ printf "%s-%s-sst%d-sd%s" .prefix $d.name (int $d.sst) (lower (toString $d.sd)) }}
+{{- else -}}
+{{ printf "%s-%s-sst%d" .prefix $d.name (int $d.sst) }}
+{{- end -}}
+{{- else -}}
+{{ printf "%s-%s" .prefix $d.name }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+S-NSSAIs a per-DNN SMF advertises in SmfInfo: (dict "ctx" . "dnn" <dnns[] entry>)
+  the entry's own sst/sd when set (must be one of .Values.slices), else every slice.
+Rendered as YAML list items "- sst: N" / "  sd: ..." for use under info.s_nssai.
+*/}}
+{{- define "open5gs.dnnSlices" -}}
+{{- $d := .dnn -}}
+{{- if hasKey $d "sst" -}}
+{{- $found := false -}}
+{{- range .ctx.Values.slices -}}
+{{- if and (eq (int .sst) (int $d.sst)) (eq (toString (default "" .sd)) (toString (default "" $d.sd))) -}}
+{{- $found = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $found -}}
+{{- fail (printf "dnns[%s]: sst %v sd %q is not listed in .Values.slices (the AMF would reject it)" $d.name $d.sst (toString (default "" $d.sd))) -}}
+{{- end }}
+- sst: {{ int $d.sst }}
+{{- if $d.sd }}
+  sd: {{ toString $d.sd | quote }}
+{{- end }}
+{{- else -}}
+{{- range .ctx.Values.slices }}
+- sst: {{ .sst }}
+{{- if .sd }}
+  sd: {{ .sd | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+{{- end -}}
+
 {{/* Shell wrapper that substitutes the pod IP into the config and execs the NF */}}
 {{- define "open5gs.nfCommand" -}}
 {{- $nf := default .name .nf -}}
