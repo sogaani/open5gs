@@ -4,6 +4,11 @@ ARG UBUNTU_TAG=24.04
 
 FROM ubuntu:${UBUNTU_TAG} AS build
 ARG SRSRAN_VERSION=release_25_10
+# x86: build for a fixed, portable ISA level instead of -march=native of the CI
+# runner (AVX512 there would crash on the cluster nodes). x86-64-v3 = AVX2/FMA.
+# arm64: NEON is implied by the architecture.
+ARG TARGETARCH
+ARG X86_ISA_FLAGS="-DGCC_ARCH=x86-64-v3 -DHAVE_SSE=ON -DHAVE_AVX=ON -DHAVE_AVX2=ON -DHAVE_FMA=ON"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates pkg-config \
@@ -13,7 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 RUN git clone --depth 1 --branch ${SRSRAN_VERSION} https://github.com/srsran/srsRAN_4G.git . \
     && mkdir build && cd build \
-    && cmake .. \
+    && if [ "${TARGETARCH:-$(dpkg --print-architecture)}" = "amd64" ]; then ISA_FLAGS="${X86_ISA_FLAGS}"; else ISA_FLAGS=""; fi \
+    && cmake .. ${ISA_FLAGS} \
          -DCMAKE_BUILD_TYPE=Release \
          -DENABLE_SRSEPC=OFF \
          -DENABLE_GUI=OFF \
