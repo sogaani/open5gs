@@ -1747,7 +1747,112 @@ AMF 内の FSM の階層:
 
 ---
 
-## 13. 参考
+## 14. 4G (EPC) を同居させる: MME/HSS/SGW/PCRF、srsRAN_4G、S6a/S8 ローミング
+
+`helm/open5gs` に `epc.enabled: true`、`srsran.enabled: true` を足すと、5GC と同じクラスタに
+EPC と srsRAN_4G の eNB/UE が載る。`helm/open5gs-mvno` 側は HSS と PCRF を持ち、MNO の MME から
+S6a、MNO の SGW-C/SGW-U から S8 で到達される (4G 版の Home-Routed ローミング)。
+
+### 14.1 構成要素の対応
+
+| 4G NF | 5GC での対応 | チャートでの実体 | 主なインターフェース |
+|---|---|---|---|
+| MME | AMF (+SMF の一部) | `open5gs-mme` (+ headless `open5gs-mme-s1ap`) | S1AP/SCTP 36412、S11 GTP-C 2123、S6a Diameter 3868 |
+| HSS | UDM + AUSF + UDR | `open5gs-hss` / `mvno-hss` | S6a、MongoDB (5GC と同じ DB) |
+| SGW-C / SGW-U | なし (UPF に統合) | `open5gs-sgwc` / `open5gs-sgwu` | S11、S5/S8-C、Sxa PFCP、S1-U/S5-U GTP-U |
+| PGW-C / PGW-U | SMF / UPF | **既存の `smf-<dnn>...` / `upf-<dnn>...` が兼任** | S5/S8-C、Gx、Sxb、S5-U |
+| PCRF | PCF | `open5gs-pcrf` / `mvno-pcrf` | Gx、MongoDB |
+| eNB + UE | UERANSIM gNB/UE | `open5gs-lte-<name>` (srsenb + srsue を 1 コンテナ) | S1AP、S1-U、ZMQ (localhost) |
+
+- どの SMF/UPF が PGW になるか: **DNN 名ごとに `dnns[]` の最初のエントリ** (例: `internet` →
+  `smf-internet-sst1`)。4G には S-NSSAI が無いので APN 名でしか選べない。その SMF にだけ
+  `gtpc.server` と `freeDiameter` (Gx) が入り、MME の `gtpc.client.smf[]` に `apn: [internet]` で
+  登録される。`dnns[].epc: false` で除外できる。
+- 加入者は 5G と共有。HSS は `slice[0].session[]` を APN リストとして読む (`src/hss/hss-s6a-path.c`)
+  ので、`subscribers[].dnn` がそのまま APN になる。
+
+### 14.2 Diameter (S6a / Gx) の Identity と Realm
+
+- **Identity (Origin-Host / Destination-Host)**: ノード 1 台の固有名。相手の CER/CEA で名乗る名前と
+  `ConnectPeer` の名前が一致しないと切断される。3GPP では `<node>.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`
+  (TS 23.003 19.4)。
+- **Realm (Origin-Realm / Destination-Realm)**: 管理ドメイン。1 PLMN に 1 つで
+  `epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` (TS 23.003 19.2)。Diameter のルーティングは IP ではなく
+  Realm 単位 (DRA の realm ルーティング表)。
+- チャートでの決め: **Identity = Service の FQDN** (`mvno-hss.mvno.svc.cluster.local` など)、
+  **Realm = 3GPP 形式**。freeDiameter は `ConnectTo` を省略すると Identity を DNS で解決するので、
+  クラスタ DNS でそのまま引け、固定 ClusterIP も hostAliases も要らない。`ListenOn`/`ConnectTo` は
+  IP リテラル限定なので `ListenOn = "__POD_IP__"`。
+- `No_SCTP;` で TCP のみ。ClusterIP Service 越しに SCTP を通す必要をなくすため。
+- 着信側 (HSS/PCRF) は `ConnectPeer` を持たず、`acl_wl.fdx` の許可リスト
+  (`ALLOW_OLD *.<namespace>.svc.cluster.local` + `epc.diameter.allowedPeers`) で未知のピアを受け入れる。
+  freeDiameter は既定で未登録ピアからの接続を拒否するため。
+- MME の HSS 選択は `hss_map` (IMSI の先頭 PLMN で一致、`src/mme/mme-context.c`)。`realm`/`host` は
+  **`plmn_id:` の中に**書く (サンプルのコメントと違い、兄弟キーだと無視される)。一致しない IMSI は
+  自 Realm 宛て。
+- fdx 拡張のパスはイメージ内で `find /usr/local/lib -name dict_nasreq.fdx` して `__FD_LIBDIR__` を置換
+  (全 NF 共通の `nfCommand` が `/config/*` を `/tmp/` にコピーする際に行う)。
+
+### 14.3 4G ローミング (S6a + S8 Home Routed) のルート
+
+```
+srsue(99971...) == ZMQ == srsenb ──S1AP──▶ open5gs-mme ──S6a (TCP)──▶ mvno-hss   (hss_map: realm epc.mnc071..., host mvno-hss...)
+                                             │  ULA: APN internet, PGW = 192.96.0.54 (session.smf.ipv4)
+                                             ▼ S11
+                                       open5gs-sgwc ──S8-C (UDP 2123)──▶ 192.96.0.54 (mvno-smf-internet Service) ──Gx──▶ mvno-pcrf
+                                             │ Sxa                                   │ Sxb
+                                       open5gs-sgwu ════ S8-U GTP-U (Pod IP 同士) ════ mvno-upf-internet ──ogstun/NAT──▶ 外部
+```
+
+- **PGW の決め方**: Open5GS の MME には PLMN ベースの PGW 選択が無い (`src/mme/mme-s11-build.c`:
+  HSS 提供アドレス → DNS (serving PLMN 固定) → `gtpc.client.smf[]` の apn/tac/e_cell_id → 先頭)。
+  そこで H-HSS が加入者データに `slice[0].session[].smf.ipv4` を持ち、ULA の MIP6-Agent-Info として
+  MME に渡す (チャートの `epc.pgwInHss: true` が subscribers Job で `dnns[].clusterIP` を書き込む)。
+  5G のコードパスはこのフィールドを読まないので 5G 加入者と共存できる。
+- SGW-C は最初の Create Session を Service の ClusterIP:2123 に送り、応答の F-TEID (SMF の Pod IP)
+  以降は Pod IP に直接送る (PFCP の SMF→UPF と同じ挙動)。
+- S8-U は SGW-U Pod と H-UPF Pod の間の GTP-U で、5G の N9 と同じく namespace をまたいだ Pod 間通信。
+- MME の `access_control` は自 PLMN と `roaming.peers[]` を許可。HSS は Visited-PLMN-Id を検査しない
+  (KASME 導出に使うのみ)。
+- 4G 用の MVNO 加入者は `999710000000002` (UERANSIM の ue4 と IMSI を分ける)。
+
+### 14.4 srsRAN_4G (ZMQ) を Kubernetes に載せる際の制約
+
+- ZMQ の仮想無線は **eNB:UE = 1:1** のみ (REQ/REP のロックステップ)。UE をデタッチしたら eNB も
+  再起動が必要。→ `srsran.ues[]` 1 エントリ = 1 Pod、1 コンテナで `srsenb` と `srsue` を両方起動し、
+  どちらかが死んだらコンテナごと終了して再起動する。
+- `mme_addr` と bind アドレスは **IP リテラル限定** (`inet_pton` のみ)。entrypoint が headless
+  `mme-s1ap` を `getent hosts` で引いて `__MME_IP__` を置換し、`gtp_bind_addr`/`s1c_bind_addr` は Pod IP。
+  MME Pod が入れ替わると IP が変わるため、liveness probe (`/proc/net/sctp/assocs` に関連付けが無い、
+  または `tun_srsue` にアドレスが無い) で Pod を作り直す。
+- `base_srate` は PHY レートの整数倍 (25 PRB なら 5.76e6)。既定の 23.04e6 より CPU が軽い。
+  1 ペアでおよそ 1〜2 コア。
+- srsue は `tun_srsue` を作るが**デフォルトルートを入れない** (`gw.cc` に `SIOCADDRT` が無い)。
+  entrypoint が UE アドレスを検出したら `ip rule from <ip> table 100` と `oif tun_srsue` の
+  ルールで table 100 (default dev tun_srsue) に流す。これで `ping -I tun_srsue 8.8.8.8` が通る。
+- srsue の PLMN 選択 (`nas::select_plmn()`) は HPLMN が見つからなければ**最初に見つけた PLMN に
+  接続する** ("Could not find Home PLMN Id=..., trying to connect to PLMN Id=...")。UERANSIM と違い
+  ローミング UE 用のパッチは不要。
+- 設定ファイルは `enb.conf`/`rr.conf`/`sib.conf`/`rb.conf`/`ue.conf`。`sib.conf` と `rb.conf` は
+  srsRAN の example をそのまま `helm/open5gs/files/srsran/` に置き `.Files.Get` で埋め込む。
+- イメージは `docker/srsran/Dockerfile` (release_25_10、`-DENABLE_SRSEPC=OFF -DAUTO_DETECT_ISA=OFF`、
+  ZMQ 有効) を GHCR ワークフローで amd64 ビルド。
+
+### 14.5 確認コマンド
+
+```bash
+kubectl -n open5gs logs deploy/open5gs-mme | grep -i "s1-setup\|attach"
+kubectl -n open5gs logs deploy/open5gs-lte-lte1 | grep -i "attach\|IP:"   # [ue] Network attach successful. IP: 10.45.x.x
+UE=$(kubectl -n open5gs get pod -l app.kubernetes.io/component=lte-lte1 -o jsonpath='{.items[0].metadata.name}')
+kubectl -n open5gs exec $UE -- ping -I tun_srsue -c 3 8.8.8.8
+# ローミング (lte4 = 999710000000002)
+kubectl -n mvno logs deploy/mvno-hss | grep 999710000000002
+kubectl -n mvno logs deploy/mvno-smf-internet | grep 999710000000002         # IPv4[10.50.x.x]
+```
+
+---
+
+## 15. 参考
 
 * Quickstart (tun、NAT、ファイアウォール、加入者登録):
   https://open5gs.org/open5gs/docs/guide/01-quickstart/

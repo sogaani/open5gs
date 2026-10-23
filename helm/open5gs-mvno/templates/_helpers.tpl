@@ -252,14 +252,18 @@ Rendered as YAML list items "- sst: N" / "  sd: ..." for use under info.s_nssai.
 {{- end -}}
 {{- end -}}
 
-{{/* Shell wrapper that substitutes the pod IP into the config and execs the NF */}}
+{{/* Shell wrapper that copies every file of the ConfigMap to /tmp, substituting the
+     pod IP (and, for freeDiameter configs, the fdx extension directory), then execs the NF */}}
 {{- define "open5gs.nfCommand" -}}
 {{- $nf := default .name .nf -}}
 command: ["/bin/sh", "-c"]
 args:
   - |
     set -e
-    sed "s/__POD_IP__/${POD_IP}/g" /config/{{ $nf }}.yaml > /tmp/{{ $nf }}.yaml
+    FD_LIBDIR=$(dirname "$(find /usr/local/lib -name dict_nasreq.fdx 2>/dev/null | head -1)")
+    for f in /config/*; do
+      sed -e "s/__POD_IP__/${POD_IP}/g" -e "s|__FD_LIBDIR__|${FD_LIBDIR}|g" "$f" > "/tmp/$(basename "$f")"
+    done
     exec open5gs-{{ $nf }}d -c /tmp/{{ $nf }}.yaml
 {{- end -}}
 
@@ -275,12 +279,17 @@ args:
      Params: ctx, name, extraPorts (list of {name,port,protocol}),
              nf (binary/config name, defaults to name),
              configPath (template path used for the checksum, defaults to /<name>/configmap.yaml),
-             nodeSelector (optional map), extraVolumeMounts / extraVolumes (optional lists) */}}
+             nodeSelector (optional map), extraVolumeMounts / extraVolumes (optional lists),
+             sbi (default true; false for EPC NFs without an SBI port),
+             readinessPort (tcpSocket port, default 7777) or readinessExec (command list) */}}
 {{- define "open5gs.nfDeployment" -}}
 {{- $name := .name -}}
 {{- $ctx := .ctx -}}
 {{- $nf := default .name .nf -}}
 {{- $configPath := default (printf "/%s/configmap.yaml" $name) .configPath -}}
+{{- $sbi := true -}}
+{{- if hasKey . "sbi" }}{{ $sbi = .sbi }}{{ end -}}
+{{- $readinessPort := default 7777 .readinessPort -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -320,17 +329,25 @@ spec:
           env:
             {{- include "open5gs.podIpEnv" . | nindent 12 }}
           ports:
+            {{- if $sbi }}
             - name: sbi
               containerPort: 7777
               protocol: TCP
+            {{- end }}
             {{- range .extraPorts }}
             - name: {{ .name }}
               containerPort: {{ .port }}
               protocol: {{ .protocol }}
             {{- end }}
           readinessProbe:
+            {{- if .readinessExec }}
+            exec:
+              command:
+                {{- toYaml .readinessExec | nindent 16 }}
+            {{- else }}
             tcpSocket:
-              port: 7777
+              port: {{ $readinessPort }}
+            {{- end }}
             initialDelaySeconds: 3
             periodSeconds: 5
           volumeMounts:
@@ -353,13 +370,16 @@ spec:
 {{/* Standard ClusterIP Service for an NF's SBI port.
      Params: ctx, name, extraPorts (list of {name,port,protocol[,targetPort]}),
              nf (optional, "smf" for per-DNN SMFs),
-             clusterIP (optional; defaults to the pinned roaming ClusterIP, if any).
+             clusterIP (optional; defaults to the pinned roaming ClusterIP, if any),
+             sbi (default true; false for EPC NFs without an SBI port).
      An NF that advertises a 3GPP FQDN also gets port 80 -> 7777: peers build
      apiRoots from the NF-instance FQDN without a port (e.g. hSmfUri, nrf.<domain>),
      which Open5GS/curl turn into port 80. */}}
 {{- define "open5gs.nfService" -}}
 {{- $clusterIP := default (include "open5gs.pinnedClusterIP" .) .clusterIP -}}
 {{- $extraPorts := .extraPorts | default list -}}
+{{- $sbi := true -}}
+{{- if hasKey . "sbi" }}{{ $sbi = .sbi }}{{ end -}}
 {{- if include "open5gs.uses3gppFqdn" . -}}
 {{- $extraPorts = append $extraPorts (dict "name" "http" "port" 80 "targetPort" 7777 "protocol" "TCP") -}}
 {{- end -}}
@@ -378,14 +398,124 @@ spec:
   selector:
     {{- include "open5gs.selector" . | nindent 4 }}
   ports:
+    {{- if $sbi }}
     - name: sbi
       port: 7777
       targetPort: 7777
       protocol: TCP
+    {{- end }}
     {{- range $extraPorts }}
     - name: {{ .name }}
       port: {{ .port }}
       targetPort: {{ .targetPort | default .port }}
       protocol: {{ .protocol }}
     {{- end }}
+{{- end -}}
+
+
+{{/* ---------------------------------------------------------------------------
+     EPC (4G) helpers (all inert unless .Values.epc.enabled)
+     --------------------------------------------------------------------------- */}}
+
+{{/* Diameter realm of a PLMN, TS 23.003 19.2: epc.mnc<MNC3>.mcc<MCC3>.3gppnetwork.org
+     (epc.realm overrides it for our own PLMN). Params: ctx, optional mcc/mnc */}}
+{{- define "open5gs.epcRealm" -}}
+{{- $e := .ctx.Values.epc | default dict -}}
+{{- if and $e.realm (not .mcc) -}}
+{{- $e.realm -}}
+{{- else -}}
+{{- $mcc := default .ctx.Values.plmn.mcc .mcc -}}
+{{- $mnc := default .ctx.Values.plmn.mnc .mnc -}}
+{{- printf "epc.mnc%03d.mcc%03d.3gppnetwork.org" (int $mnc) (int $mcc) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Diameter Identity (Origin-Host) of a component: its Service FQDN, so peers can
+     resolve it through cluster DNS without ConnectTo. Params: ctx, name */}}
+{{- define "open5gs.fdIdentity" -}}
+{{ include "open5gs.fqdn" . }}
+{{- end -}}
+
+{{/* dnns[] entries that also serve their DNN name as a 4G APN (PGW-C/PGW-U):
+     the first entry per name, unless it sets epc: false. Rendered as a YAML list. */}}
+{{- define "open5gs.epcDnns" -}}
+{{- $seen := dict -}}
+{{- $out := list -}}
+{{- range .Values.dnns -}}
+{{- $skip := false -}}
+{{- if hasKey . "epc" }}{{ if not .epc }}{{ $skip = true }}{{ end }}{{ end -}}
+{{- if and (not $skip) (not (hasKey $seen .name)) -}}
+{{- $_ := set $seen .name true -}}
+{{- $out = append $out . -}}
+{{- end -}}
+{{- end -}}
+{{ toYaml $out }}
+{{- end -}}
+
+{{/* The dnns[] entry serving a given APN for 4G (empty YAML map if none).
+     Params: ctx, apn */}}
+{{- define "open5gs.epcDnnFor" -}}
+{{- $found := dict -}}
+{{- range (include "open5gs.epcDnns" .ctx | fromYamlArray) -}}
+{{- if and (eq .name $.apn) (not $found.name) }}{{ $found = . }}{{ end -}}
+{{- end -}}
+{{ toYaml $found }}
+{{- end -}}
+
+{{/* freeDiameter configuration file.
+     Params: ctx, nf (mme|hss|smf|pcrf), identity, realm,
+             peers (list of Diameter identities to connect to; resolved via DNS),
+             acl (optional list of allowed inbound peer patterns; loads acl_wl.fdx).
+     TCP only (No_SCTP): the peers are reached through ClusterIP Services. */}}
+{{- define "open5gs.fdConf" -}}
+Identity = {{ .identity | quote }};
+Realm = {{ .realm | quote }};
+Port = 3868;
+# No TLS: freeDiameter requires the certificate CN to match the Identity, and
+# the shipped certs are issued for <nf>.localdomain. SecPort 0 disables TLS.
+SecPort = 0;
+No_SCTP;
+ListenOn = "__POD_IP__";
+NoRelay;
+LoadExtension = "__FD_LIBDIR__/dbg_msg_dumps.fdx" : "0x8888";
+LoadExtension = "__FD_LIBDIR__/dict_rfc5777.fdx";
+LoadExtension = "__FD_LIBDIR__/dict_mip6i.fdx";
+LoadExtension = "__FD_LIBDIR__/dict_nasreq.fdx";
+LoadExtension = "__FD_LIBDIR__/dict_nas_mipv6.fdx";
+LoadExtension = "__FD_LIBDIR__/dict_dcca.fdx";
+LoadExtension = "__FD_LIBDIR__/dict_dcca_3gpp.fdx";
+{{- if .acl }}
+LoadExtension = "__FD_LIBDIR__/acl_wl.fdx" : "/tmp/acl_wl.conf";
+{{- end }}
+{{- range .peers }}
+ConnectPeer = {{ . | quote }} { No_TLS; };
+{{- end }}
+{{- end -}}
+
+{{/* acl_wl.conf: inbound Diameter peers accepted without a ConnectPeer entry
+     (ALLOW_IPSEC = unprotected transport, i.e. the peers' No_TLS).
+     Our own namespace is always allowed; epc.diameter.allowedPeers adds patterns
+     (e.g. "*.open5gs.svc.cluster.local" on the home HSS for the visited MME). */}}
+{{- define "open5gs.fdAclPatterns" -}}
+- "*.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}"
+{{- range ((.Values.epc | default dict).diameter | default dict).allowedPeers }}
+- {{ . | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "open5gs.fdAclConf" -}}
+{{- range (include "open5gs.fdAclPatterns" . | fromYamlArray) }}
+ALLOW_IPSEC {{ . }}
+{{- end }}
+{{- end -}}
+
+{{/* "true" when this dnns[] entry is the one serving its DNN name as a 4G APN
+     (epc.enabled and first entry per name). Params: ctx, dnn */}}
+{{- define "open5gs.isEpcDnn" -}}
+{{- $e := .ctx.Values.epc | default dict -}}
+{{- if $e.enabled -}}
+{{- $me := include "open5gs.dnnName" (dict "ctx" .ctx "prefix" "smf" "dnn" .dnn) -}}
+{{- $apn := include "open5gs.epcDnnFor" (dict "ctx" .ctx "apn" .dnn.name) | fromYaml -}}
+{{- if and $apn.name (eq (include "open5gs.dnnName" (dict "ctx" .ctx "prefix" "smf" "dnn" $apn)) $me) -}}true{{- end -}}
+{{- end -}}
 {{- end -}}

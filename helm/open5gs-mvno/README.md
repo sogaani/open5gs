@@ -13,6 +13,8 @@ anchored here and the UE gets an address from `dnns[].subnet` (10.50.0.0/16).
 | mvno-nrf, -ausf, -udm, -nssf, mvno-smf-\<dnn\> | advertise `<name>.5gc.mnc071.mcc999.3gppnetwork.org:7777` on pinned ClusterIPs (`roaming.fqdnNfs`, `dnns[].clusterIP`); each Service also maps :80 to 7777 (peers use port-less apiRoots such as `hSmfUri`) |
 | mvno-upf-\<dnn\> | H-UPF: N9 GTP-U from the MNO V-UPF arrives on the pod IP; UE traffic is NATed to the pod IP |
 | mvno-webui | subscriber management, LoadBalancer `172.31.254.21:9999`, admin / 1423 |
+| mvno-hss, mvno-pcrf (`epc.enabled`, default on) | 4G home HSS (S6a from the visited MME) and PCRF (Gx from the PGW-C); Diameter over TCP 3868, identity = Service FQDN, realm `epc.mnc071.mcc999.3gppnetwork.org` |
+| mvno-smf-\<dnn\> as PGW-C | also listens on GTP-C 2123/UDP; its pinned ClusterIP is the S8 PGW address the HSS sends to the MME (`epc.pgwInHss`) |
 
 ## Install
 
@@ -42,10 +44,27 @@ Same layout as `helm/open5gs` without `amf`, `tac` and `ueransim`:
 | `roaming.peers[]` | `open5gs-sepp.open5gs.svc.cluster.local` 7778/7779 | The MNO SEPP (PLMN 999/70) |
 | `roaming.sepp.tls.existingSecret` | `sepp-tls` | Secret with `ca.crt`, `tls.crt`, `tls.key` (or pass `tls.ca/cert/key` PEM) |
 | `webui.service.loadBalancerIP` | 172.31.254.21 | |
+| `epc.enabled` | `true` | Deploy HSS and PCRF; the SMF/UPF double as PGW-C/PGW-U |
+| `epc.pgwInHss` | `true` | Write `session.smf.ipv4 = dnns[].clusterIP` into every subscriber (the visited MME learns the home PGW from the HSS) |
+| `epc.diameter.allowedPeers` | `["*.open5gs.svc.cluster.local"]` | Inbound Diameter peers accepted by the HSS/PCRF (the visited MME's identity is `open5gs-mme.open5gs.svc.cluster.local`) |
+
+## 4G (S6a / S8 home routed)
+
+A 4G USIM of this PLMN on an MNO eNB (`helm/open5gs` with `epc.enabled`, `srsran.ues[]` entry
+`lte4`, `roaming.peers[].epc.hss: mvno-hss.mvno.svc.cluster.local`) is served as follows:
+
+1. The visited MME matches the IMSI prefix in its `hss_map` and sends AIR/ULR with
+   Destination-Realm `epc.mnc071.mcc999.3gppnetwork.org` / Destination-Host `mvno-hss...`
+   (TCP to the `mvno-hss` Service; accepted through the acl_wl allow list).
+2. The ULA carries the APN list from `subscribers[]` and, per APN, the PGW address
+   (`session.smf.ipv4`, MIP6-Agent-Info) = the ClusterIP of `mvno-smf-<dnn>`.
+3. The visited SGW-C opens S8 (GTP-C 2123) to that address; the H-SMF does Gx with `mvno-pcrf`
+   (subscriber in the MVNO MongoDB) and Sxb with `mvno-upf-<dnn>`.
+4. S8-U runs between the visited SGW-U pod and the `mvno-upf` pod; the UE gets `10.50.x.x`.
 
 ## Keeping the templates in sync
 
-`templates/` and `_helpers.tpl` are copies of the MNO chart (minus `amf/` and `ueransim/`), with
+`templates/` and `_helpers.tpl` are copies of the MNO chart (minus `amf/`, `ueransim/`, `mme/`, `sgwc/`, `sgwu/` and `srsran/`), with
 `app.kubernetes.io/name: open5gs-mvno`. Check for drift with:
 
 ```bash

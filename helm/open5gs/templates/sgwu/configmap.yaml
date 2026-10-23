@@ -1,0 +1,20 @@
+{{- if .Values.epc.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "sgwu") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sgwu
+data:
+  sgwu.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    sgwu:
+      pfcp:
+        server:
+          - address: __POD_IP__
+      # S1-U / S5-U F-TEIDs carry this pod IP (eNB and PGW-U send GTP-U to the pod directly)
+      gtpu:
+        server:
+          - address: __POD_IP__
+{{- end }}

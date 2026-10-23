@@ -1,0 +1,4 @@
+{{- if .Values.epc.enabled }}
+{{- $ports := list (dict "name" "pfcp" "port" 8805 "protocol" "UDP") (dict "name" "gtpu" "port" 2152 "protocol" "UDP") -}}
+{{- include "open5gs.nfDeployment" (dict "ctx" . "name" "sgwu" "sbi" false "readinessExec" (list "/bin/sh" "-c" "ss -lun | grep -q ':8805 '") "extraPorts" $ports) }}
+{{- end }}

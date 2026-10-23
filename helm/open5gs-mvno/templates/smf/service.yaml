@@ -2,6 +2,11 @@
 {{- $ports := list (dict "name" "pfcp" "port" 8805 "protocol" "UDP") (dict "name" "metrics" "port" 9090 "protocol" "TCP") }}
 {{- range $d := .Values.dnns }}
 {{- $name := include "open5gs.dnnName" (dict "ctx" $root "prefix" "smf" "dnn" $d) }}
+{{- $p := $ports }}
+{{- /* S5/S8-C: the MME (own PLMN) and, with epc.pgwInHss, a visited SGW-C address this Service */}}
+{{- if include "open5gs.isEpcDnn" (dict "ctx" $root "dnn" $d) }}
+{{- $p = append $p (dict "name" "gtpc" "port" 2123 "protocol" "UDP") }}
+{{- end }}
 ---
-{{ include "open5gs.nfService" (dict "ctx" $root "name" $name "nf" "smf" "extraPorts" $ports "clusterIP" (default "" $d.clusterIP)) }}
+{{ include "open5gs.nfService" (dict "ctx" $root "name" $name "nf" "smf" "extraPorts" $p "clusterIP" (default "" $d.clusterIP)) }}
 {{- end }}

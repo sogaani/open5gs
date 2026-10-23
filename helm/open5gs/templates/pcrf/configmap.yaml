@@ -1,0 +1,24 @@
+{{- if .Values.epc.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "pcrf") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pcrf
+data:
+  pcrf.yaml: |
+    db_uri: {{ include "open5gs.mongoUri" . }}
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    pcrf:
+      freeDiameter: /tmp/pcrf-fd.conf
+      metrics:
+        server:
+          - address: __POD_IP__
+            port: 9090
+  # Gx server: no ConnectPeer; inbound peers are accepted through acl_wl.conf.
+  pcrf-fd.conf: |
+    {{- include "open5gs.fdConf" (dict "ctx" . "nf" "pcrf" "identity" (include "open5gs.fdIdentity" (dict "ctx" . "name" "pcrf")) "realm" (include "open5gs.epcRealm" (dict "ctx" .)) "peers" (list) "acl" true) | nindent 4 }}
+  acl_wl.conf: |
+    {{- include "open5gs.fdAclConf" . | trim | nindent 4 }}
+{{- end }}

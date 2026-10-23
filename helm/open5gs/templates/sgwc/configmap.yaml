@@ -1,0 +1,22 @@
+{{- if .Values.epc.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "sgwc") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sgwc
+data:
+  sgwc.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    sgwc:
+      gtpc:
+        server:
+          - address: __POD_IP__
+      pfcp:
+        server:
+          - address: __POD_IP__
+        client:
+          sgwu:
+            - address: {{ include "open5gs.fqdn" (dict "ctx" . "name" "sgwu") }}
+{{- end }}

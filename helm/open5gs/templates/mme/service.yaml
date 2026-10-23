@@ -1,0 +1,23 @@
+{{- if .Values.epc.enabled }}
+{{- $ports := list (dict "name" "gtpc" "port" 2123 "protocol" "UDP") (dict "name" "diameter" "port" 3868 "protocol" "TCP") (dict "name" "metrics" "port" 9090 "protocol" "TCP") -}}
+{{- include "open5gs.nfService" (dict "ctx" . "name" "mme" "sbi" false "extraPorts" $ports) }}
+---
+# Headless Service for S1-MME: the eNB resolves this name to the MME pod IP and
+# opens SCTP directly to the pod (same pattern as amf-ngap).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "mme-s1ap") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mme
+spec:
+  clusterIP: None
+  selector:
+    {{- include "open5gs.selector" (dict "ctx" . "name" "mme") | nindent 4 }}
+  ports:
+    - name: s1ap
+      port: 36412
+      targetPort: 36412
+      protocol: SCTP
+{{- end }}

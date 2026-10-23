@@ -14,6 +14,30 @@ roaming:
         host: mvno-sepp.mvno.svc.cluster.local
         n32cPort: 7778
         n32fPort: 7779
+      epc:
+        hss: mvno-hss.mvno.svc.cluster.local
+
+# 4G: EPC in this PLMN plus srsRAN eNB/UE pods. lte4 is an MVNO USIM (IMSI 99971...)
+# attaching through S6a to mvno-hss and S8 to the MVNO PGW (home routed).
+epc:
+  enabled: true
+srsran:
+  enabled: true
+  ues:
+    - name: lte1
+      imsi: "999700000000001"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      apn: internet
+      enbId: "0x19B"
+      pci: 1
+    - name: lte4
+      imsi: "999710000000002"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6C2"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      apn: internet
+      enbId: "0x19C"
+      pci: 2
 
 # Every SMF advertises a 3GPP FQDN in roaming mode, so each needs a pinned ClusterIP.
 # Lists replace lists in Helm: repeat your full dnns[] here.

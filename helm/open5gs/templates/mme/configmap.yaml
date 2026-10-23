@@ -1,0 +1,78 @@
+{{- if .Values.epc.enabled }}
+{{- $r := .Values.roaming | default dict }}
+{{- /* Diameter peers: our HSS plus the home HSS of every roaming peer PLMN (hss_map) */}}
+{{- $peers := list (include "open5gs.fdIdentity" (dict "ctx" . "name" "hss")) }}
+{{- if $r.enabled }}
+{{- range $r.peers }}{{ if and .epc .epc.hss }}{{ $peers = append $peers .epc.hss }}{{ end }}{{ end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "mme") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mme
+data:
+  mme.yaml: |
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    mme:
+      freeDiameter: /tmp/mme-fd.conf
+      s1ap:
+        server:
+          - address: __POD_IP__
+      gtpc:
+        server:
+          - address: __POD_IP__
+        client:
+          sgwc:
+            - address: {{ include "open5gs.fqdn" (dict "ctx" . "name" "sgwc") }}
+          # PGW-C = the SMF serving each APN (first dnns[] entry per DNN name).
+          # Roaming subscribers get their home PGW from the HSS instead (MIP6-Agent-Info).
+          smf:
+            {{- range (include "open5gs.epcDnns" . | fromYamlArray) }}
+            - address: {{ include "open5gs.fqdn" (dict "ctx" $ "name" (include "open5gs.dnnName" (dict "ctx" $ "prefix" "smf" "dnn" .))) }}
+              apn: [{{ .name }}]
+            {{- end }}
+      metrics:
+        server:
+          - address: __POD_IP__
+            port: 9090
+      gummei:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+          mme_gid: {{ .Values.epc.mme.gid }}
+          mme_code: {{ .Values.epc.mme.code }}
+      tai:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+          tac: {{ .Values.tac }}
+      security:
+        integrity_order: [ EIA2, EIA1, EIA0 ]
+        ciphering_order: [ EEA0, EEA1, EEA2 ]
+      network_name:
+        full: {{ .Values.amf.networkName.full }}
+        short: {{ .Values.amf.networkName.short }}
+      mme_name: {{ .Values.epc.mme.name }}
+      {{- if $r.enabled }}
+      # IMSIs of these PLMNs are accepted (others: PLMN not allowed)
+      access_control:
+        - {{- include "open5gs.plmnId" . | nindent 10 }}
+        {{- range $r.peers }}
+        - plmn_id:
+            mcc: {{ .mcc | quote }}
+            mnc: {{ .mnc | quote }}
+        {{- end }}
+      # S6a routing by IMSI prefix: Destination-Realm/Host of the home HSS.
+      # (realm/host must sit inside plmn_id: that is how Open5GS parses it.)
+      hss_map:
+        {{- range $r.peers }}
+        {{- if and .epc .epc.hss }}
+        - plmn_id:
+            mcc: {{ .mcc | quote }}
+            mnc: {{ .mnc | quote }}
+            realm: {{ include "open5gs.epcRealm" (dict "ctx" $ "mcc" .mcc "mnc" .mnc) }}
+            host: {{ .epc.hss }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+  mme-fd.conf: |
+    {{- include "open5gs.fdConf" (dict "ctx" . "nf" "mme" "identity" (include "open5gs.fdIdentity" (dict "ctx" . "name" "mme")) "realm" (include "open5gs.epcRealm" (dict "ctx" .)) "peers" $peers) | nindent 4 }}
+{{- end }}

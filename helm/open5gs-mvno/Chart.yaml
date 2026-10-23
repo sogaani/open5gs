@@ -1,6 +1,6 @@
 apiVersion: v2
 name: open5gs-mvno
-description: Open5GS Home PLMN for a full MVNO (UDM/UDR/AUSF/PCF/SMF/UPF, no AMF or RAN), reached from the MNO core through SEPP (N32)
+description: Open5GS Home PLMN for a full MVNO (UDM/UDR/AUSF/PCF/SMF/UPF plus HSS/PCRF for 4G, no AMF/MME or RAN), reached from the MNO core through SEPP (N32) and S6a/S8
 type: application
 version: 0.1.0
 appVersion: "2.8"

@@ -51,6 +51,13 @@ subscribers:
     amf: "8000"
     sst: 1
     dnn: internet
+  # 4G USIM used by the srsRAN UE "lte4" in the MNO chart (values-roaming.yaml)
+  - imsi: "999710000000002"
+    key: "465B5CE8B199B49FAA5F0A2EE238A6C2"
+    opc: "E8ED289DEBA952E4283B54E88E6183CA"
+    amf: "8000"
+    sst: 1
+    dnn: internet
 
 mongodb:
   image: mongo:7
@@ -105,3 +112,24 @@ roaming:
     policy: []
 
 resources: {}
+
+# ---------------------------------------------------------------------------
+# 4G: home HSS and PCRF; the SMF/UPF above also act as PGW-C/PGW-U. The visited
+# MME (helm/open5gs, roaming.peers[].epc.hss = mvno-hss...) reaches the HSS over
+# S6a and learns the PGW address from the subscription (pgwInHss ->
+# session.smf.ipv4 = dnns[].clusterIP), then its SGW-C opens S8 to that address.
+# ---------------------------------------------------------------------------
+epc:
+  enabled: true
+  realm: ""
+  mme:
+    name: unused
+    gid: 1
+    code: 1
+  pgwInHss: true
+  diameter:
+    # the visited MME's Diameter identity is <release>-mme.<namespace>.svc.cluster.local
+    allowedPeers:
+      - "*.open5gs.svc.cluster.local"
+srsran:
+  enabled: false

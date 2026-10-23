@@ -1,0 +1,24 @@
+{{- if .Values.epc.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" . "name" "hss") }}
+  labels:
+    {{- include "open5gs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hss
+data:
+  hss.yaml: |
+    db_uri: {{ include "open5gs.mongoUri" . }}
+    {{- include "open5gs.configHeader" . | nindent 4 }}
+    hss:
+      freeDiameter: /tmp/hss-fd.conf
+      metrics:
+        server:
+          - address: __POD_IP__
+            port: 9090
+  # S6a server: no ConnectPeer; inbound peers are accepted through acl_wl.conf.
+  hss-fd.conf: |
+    {{- include "open5gs.fdConf" (dict "ctx" . "nf" "hss" "identity" (include "open5gs.fdIdentity" (dict "ctx" . "name" "hss")) "realm" (include "open5gs.epcRealm" (dict "ctx" .)) "peers" (list) "acl" true) | nindent 4 }}
+  acl_wl.conf: |
+    {{- include "open5gs.fdAclConf" . | trim | nindent 4 }}
+{{- end }}

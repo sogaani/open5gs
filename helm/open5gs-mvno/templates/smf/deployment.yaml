@@ -2,6 +2,10 @@
 {{- $ports := list (dict "name" "pfcp" "port" 8805 "protocol" "UDP") (dict "name" "gtpu" "port" 2152 "protocol" "UDP") (dict "name" "metrics" "port" 9090 "protocol" "TCP") }}
 {{- range $d := .Values.dnns }}
 {{- $name := include "open5gs.dnnName" (dict "ctx" $root "prefix" "smf" "dnn" $d) }}
+{{- $p := $ports }}
+{{- if include "open5gs.isEpcDnn" (dict "ctx" $root "dnn" $d) }}
+{{- $p = append $p (dict "name" "gtpc" "port" 2123 "protocol" "UDP") }}
+{{- end }}
 ---
-{{ include "open5gs.nfDeployment" (dict "ctx" $root "name" $name "nf" "smf" "configPath" "/smf/configmap.yaml" "extraPorts" $ports "nodeSelector" $d.nodeSelector) }}
+{{ include "open5gs.nfDeployment" (dict "ctx" $root "name" $name "nf" "smf" "configPath" "/smf/configmap.yaml" "extraPorts" $p "nodeSelector" $d.nodeSelector) }}
 {{- end }}

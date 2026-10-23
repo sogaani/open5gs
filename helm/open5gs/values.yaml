@@ -59,6 +59,8 @@ dnns:
     # sst: 1            # serve this DNN only for S-NSSAI sst 1 (names become *-internet-sst1)
     # sd: "000001"      # optional, together with sst
     # nodeSelector: { kubernetes.io/hostname: node-a }   # pin this DNN's SMF and UPF to a node
+    # epc: false        # with epc.enabled, the first entry per DNN name is also the 4G APN
+                        # (its SMF/UPF act as PGW-C/PGW-U); set false to skip this entry
   - name: internet    # same DNN name, different slice -> separate SMF/UPF (smf-internet-sst2)
     sst: 2
     subnet: 10.46.0.0/16
@@ -222,6 +224,9 @@ roaming:
         host: mvno-sepp.mvno.svc.cluster.local
         n32cPort: 7778
         n32fPort: 7779
+      # 4G: Diameter identity of the home HSS (MME hss_map for IMSIs of this PLMN)
+      # epc:
+      #   hss: mvno-hss.mvno.svc.cluster.local
   sepp:
     # N32 identity sent in the N32-c handshake; the peer lists it as "receiver".
     # "" = this SEPP's own Service FQDN (<release>-sepp.<namespace>.svc.<domain>).
@@ -243,3 +248,53 @@ roaming:
     # configs/open5gs/pcf.yaml.in). [] = one auto-generated entry per peer covering
     # every slice and DNN with QoS index 9 and 1 Gbps AMBR.
     policy: []
+
+# ---------------------------------------------------------------------------
+# 4G / EPC. Off by default. With epc.enabled the chart adds MME, HSS, SGW-C,
+# SGW-U and PCRF; the SMF/UPF of the first dnns[] entry per DNN name also act
+# as PGW-C/PGW-U for that APN (S5/S8-C, Gx). Subscribers are shared with 5G
+# (the HSS reads slice[0].session[] as the APN list). Diameter identities are
+# the Service FQDNs, the realm is the 3GPP one (TS 23.003 19.2); S6a/Gx run
+# over TCP through the ClusterIP Services.
+# ---------------------------------------------------------------------------
+epc:
+  enabled: false
+  # Diameter realm of this PLMN; "" = epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
+  realm: ""
+  mme:
+    name: open5gs-mme0
+    gid: 2
+    code: 1
+  # Home PLMN only: write the PGW address (dnns[].clusterIP of the APN's SMF) into
+  # every subscriber, so a visited MME learns the home PGW from the HSS (S8).
+  pgwInHss: false
+  diameter:
+    # Inbound Diameter peers accepted by the HSS/PCRF besides this namespace
+    # (acl_wl patterns), e.g. the visited MME's namespace on a home HSS.
+    allowedPeers: []
+
+# ---------------------------------------------------------------------------
+# srsRAN_4G eNB + UE (ZMQ virtual radio), one pod per UE. Needs epc.enabled.
+# ---------------------------------------------------------------------------
+srsran:
+  enabled: false
+  image:
+    repository: ghcr.io/sogaani/srsran-4g
+    tag: sogaani-test
+    pullPolicy: Always
+  nPrb: 25
+  # ZMQ sample rate; must be an integer multiple of the PHY rate (25 PRB: 5.76e6, 50: 11.52e6, 100: 23.04e6)
+  baseSrate: "5.76e6"
+  dlEarfcn: 3350
+  logLevel: warning
+  # Default resources for every pair (a 25 PRB pair needs about 1-2 CPUs)
+  resources: {}
+  ues:
+    - name: lte1
+      imsi: "999700000000001"
+      key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
+      opc: "E8ED289DEBA952E4283B54E88E6183CA"
+      apn: internet
+      enbId: "0x19B"
+      pci: 1
+      # tac: 1, cellId: 1, dlEarfcn: 3350, imei: "353490069873319", resources: {}, nodeSelector: {}

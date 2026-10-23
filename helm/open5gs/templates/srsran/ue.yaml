@@ -1,0 +1,272 @@
+{{- if and .Values.srsran.enabled .Values.epc.enabled }}
+{{- $root := . }}
+{{- $sr := .Values.srsran }}
+{{- $mmeS1ap := include "open5gs.fqdn" (dict "ctx" . "name" "mme-s1ap") }}
+{{- range $ue := $sr.ues }}
+{{- $name := printf "lte-%s" $ue.name }}
+---
+# One srsRAN_4G eNB + UE pair per entry. The ZMQ "radio" is strictly one eNB
+# to one UE and the pair must be restarted together after a detach, so both run
+# in one container of one pod and talk ZMQ over localhost.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+data:
+  enb.conf: |
+    [enb]
+    enb_id = {{ $ue.enbId }}
+    mcc = {{ $root.Values.plmn.mcc }}
+    mnc = {{ $root.Values.plmn.mnc }}
+    # srsenb takes IP literals only; resolved from the headless MME Service at start
+    mme_addr = __MME_IP__
+    gtp_bind_addr = __POD_IP__
+    s1c_bind_addr = __POD_IP__
+    s1c_bind_port = 0
+    n_prb = {{ $sr.nPrb }}
+
+    [enb_files]
+    sib_config = /tmp/sib.conf
+    rr_config  = /tmp/rr.conf
+    rb_config  = /tmp/rb.conf
+
+    [rf]
+    device_name = zmq
+    device_args = fail_on_disconnect=true,tx_port=tcp://*:2000,rx_port=tcp://127.0.0.1:2001,id=enb,base_srate={{ $sr.baseSrate }}
+    tx_gain = 80
+    rx_gain = 40
+
+    [pcap]
+
+    [log]
+    all_level = {{ $sr.logLevel | default "warning" }}
+    all_hex_limit = 32
+    filename = stdout
+    file_max_size = -1
+
+    [gui]
+    enable = false
+
+    [expert]
+    max_s1_setup_retries = -1
+  rr.conf: |
+    mac_cnfg =
+    {
+      phr_cnfg =
+      {
+        dl_pathloss_change = "dB3";
+        periodic_phr_timer = 50;
+        prohibit_phr_timer = 0;
+      };
+      ulsch_cnfg =
+      {
+        max_harq_tx = 4;
+        periodic_bsr_timer = 20;
+        retx_bsr_timer = 320;
+      };
+      time_alignment_timer = -1;
+    };
+    phy_cnfg =
+    {
+      phich_cnfg =
+      {
+        duration  = "Normal";
+        resources = "1/6";
+      };
+      pusch_cnfg_ded =
+      {
+        beta_offset_ack_idx = 6;
+        beta_offset_ri_idx  = 6;
+        beta_offset_cqi_idx = 6;
+      };
+      sched_request_cnfg =
+      {
+        dsr_trans_max = 64;
+        period = 20;
+        nof_prb = 1;
+      };
+      cqi_report_cnfg =
+      {
+        mode = "periodic";
+        simultaneousAckCQI = true;
+        period = 40;
+        m_ri = 8;
+      };
+    };
+    cell_list =
+    (
+      {
+        cell_id = {{ $ue.cellId | default 1 }};
+        tac = {{ $ue.tac | default $root.Values.tac }};
+        pci = {{ $ue.pci | default 1 }};
+        dl_earfcn = {{ $ue.dlEarfcn | default $sr.dlEarfcn }};
+        ho_active = false;
+        scell_list = ( );
+        meas_cell_list = ( );
+        meas_report_desc = ( );
+        meas_quant_desc = {
+          rsrq_config = 4;
+          rsrp_config = 4;
+        };
+      }
+    );
+    nr_cell_list =
+    (
+    );
+  sib.conf: |
+    {{- $root.Files.Get "files/srsran/sib.conf" | nindent 4 }}
+  rb.conf: |
+    {{- $root.Files.Get "files/srsran/rb.conf" | nindent 4 }}
+  ue.conf: |
+    [rf]
+    device_name = zmq
+    device_args = tx_port=tcp://*:2001,rx_port=tcp://127.0.0.1:2000,id=ue,base_srate={{ $sr.baseSrate }}
+    freq_offset = 0
+    tx_gain = 80
+
+    [rat.eutra]
+    dl_earfcn = {{ $ue.dlEarfcn | default $sr.dlEarfcn }}
+
+    [rat.nr]
+    nof_carriers = 0
+
+    [pcap]
+    enable = none
+
+    [log]
+    all_level = {{ $sr.logLevel | default "warning" }}
+    phy_lib_level = none
+    all_hex_limit = 32
+    filename = stdout
+    file_max_size = -1
+
+    [usim]
+    mode = soft
+    algo = milenage
+    opc  = {{ $ue.opc }}
+    k    = {{ $ue.key }}
+    imsi = {{ $ue.imsi }}
+    imei = {{ $ue.imei | default "353490069873319" }}
+
+    [rrc]
+
+    [nas]
+    apn = {{ $ue.apn | default "internet" }}
+    apn_protocol = ipv4
+
+    [gw]
+
+    [gui]
+    enable = false
+  entrypoint.sh: |
+    set -e
+    MME={{ $mmeS1ap }}
+    # The S1 Service is headless: its record appears when the MME pod is ready.
+    while :; do
+      MME_IP=$(getent hosts "$MME" | awk '{print $1; exit}')
+      [ -n "$MME_IP" ] && break
+      echo "waiting for MME ($MME)"; sleep 3
+    done
+    for f in enb.conf rr.conf sib.conf rb.conf ue.conf; do
+      sed -e "s/__POD_IP__/${POD_IP}/g" -e "s/__MME_IP__/${MME_IP}/g" "/config/$f" > "/tmp/$f"
+    done
+    echo "[ran] eNB=${POD_IP} MME=${MME_IP} IMSI={{ $ue.imsi }}"
+    srsenb /tmp/enb.conf 2>&1 | sed -u 's/^/[enb] /' &
+    ENB=$!
+    sleep 5
+    srsue /tmp/ue.conf 2>&1 | sed -u 's/^/[ue] /' &
+    UE=$!
+    # srsue creates tun_srsue but installs no default route. Send traffic that
+    # originates from the UE address (or is bound to the device, e.g.
+    # `ping -I tun_srsue`) through the tunnel via a separate routing table.
+    LAST=""
+    while kill -0 $ENB 2>/dev/null && kill -0 $UE 2>/dev/null; do
+      IP=$(ip -4 -o addr show dev tun_srsue 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+      if [ -n "$IP" ] && [ "$IP" != "$LAST" ]; then
+        [ -n "$LAST" ] && ip rule del from "$LAST" table 100 2>/dev/null || true
+        ip rule add from "$IP" table 100 2>/dev/null || true
+        ip rule add oif tun_srsue table 100 2>/dev/null || true
+        ip route replace default dev tun_srsue table 100
+        echo "[ran] UE address $IP: default route via tun_srsue (table 100)"
+        LAST=$IP
+      fi
+      sleep 2
+    done
+    echo "[ran] srsenb or srsue exited: restarting the pair"
+    pkill srsue 2>/dev/null || true
+    pkill srsenb 2>/dev/null || true
+    exit 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+  labels:
+    {{- include "open5gs.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open5gs.selector" (dict "ctx" $root "name" $name) | nindent 8 }}
+      annotations:
+        checksum/config: {{ print $ue $sr.nPrb $sr.baseSrate $sr.dlEarfcn $root.Values.plmn $root.Values.tac | sha256sum }}
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ue.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ran
+          image: "{{ $sr.image.repository }}:{{ $sr.image.tag }}"
+          imagePullPolicy: {{ $sr.image.pullPolicy }}
+          command: ["/bin/sh", "/config/entrypoint.sh"]
+          env:
+            {{- include "open5gs.podIpEnv" $root | nindent 12 }}
+          # srsue creates tun_srsue and the entrypoint adds routes
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "SYS_NICE"]
+          ports:
+            - name: s1u
+              containerPort: 2152
+              protocol: UDP
+          # Healthy = S1 association up (the first line of the proc file is a
+          # header) and the UE attached (tun_srsue has an address). Restarting
+          # the pod re-resolves the MME and restarts the eNB/UE pair.
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "[ $(wc -l < /proc/net/sctp/assocs) -gt 1 ] && ip -4 -o addr show dev tun_srsue | grep -q inet"]
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+          resources:
+            {{- toYaml ($ue.resources | default $sr.resources | default dict) | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "open5gs.component" (dict "ctx" $root "name" $name) }}
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+{{- end }}
+{{- end }}

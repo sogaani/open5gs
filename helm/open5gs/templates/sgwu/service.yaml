@@ -1,0 +1,5 @@
+{{- if .Values.epc.enabled }}
+{{- /* PFCP only: GTP-U goes to the pod IP advertised in the F-TEIDs */ -}}
+{{- $ports := list (dict "name" "pfcp" "port" 8805 "protocol" "UDP") -}}
+{{- include "open5gs.nfService" (dict "ctx" . "name" "sgwu" "sbi" false "extraPorts" $ports) }}
+{{- end }}

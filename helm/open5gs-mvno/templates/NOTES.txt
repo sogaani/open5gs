@@ -30,5 +30,14 @@ SEPP (N32 to the visited PLMN{{ if gt (len .Values.roaming.peers) 1 }}s{{ end }}
 Roaming UEs are simulated from the MNO chart: set ueransim.ues[].hplmn to {{ .Values.plmn.mcc }}/{{ .Values.plmn.mnc }}
 and use an IMSI from subscribers[] above. Expected UE address: {{ (index .Values.dnns 0).subnet }} via {{ include "open5gs.component" (dict "ctx" . "name" (include "open5gs.dnnName" (dict "ctx" . "prefix" "upf" "dnn" (index .Values.dnns 0)))) }}.
 
+{{- if .Values.epc.enabled }}
+
+4G (S6a / S8 home routed)
+  HSS  : {{ include "open5gs.fdIdentity" (dict "ctx" . "name" "hss") }}  realm {{ include "open5gs.epcRealm" (dict "ctx" .) }}
+  PGW  : {{ range (include "open5gs.epcDnns" . | fromYamlArray) }}{{ .name }} -> {{ .clusterIP }}:2123 ({{ include "open5gs.dnnName" (dict "ctx" $ "prefix" "smf" "dnn" .) }})  {{ end }}
+  Visited MMEs are accepted from: {{ include "open5gs.fdAclPatterns" . | fromYamlArray | join ", " }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "open5gs.component" (dict "ctx" . "name" "hss") }}
+{{- end }}
+
 Core status
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}

@@ -24,6 +24,8 @@ data:
                pre_emption_capability: NumberInt(1), pre_emption_vulnerability: NumberInt(2) } },
         ambr: ambr(), pcc_rule: [], _id: new ObjectId() };
       if (s.ipv4) { session.ue = { ipv4: s.ipv4 }; }
+      // 4G: PGW address the HSS hands to the (visited) MME as MIP6-Agent-Info
+      if (s.pgw) { session.smf = { ipv4: s.pgw }; }
       var slice = { sst: NumberInt(s.sst), default_indicator: true, session: [session], _id: new ObjectId() };
       if (s.sd) { slice.sd = s.sd; }
       db.subscribers.insertOne({
@@ -36,11 +38,18 @@ data:
         operator_determined_barring: 0, subscribed_rau_tau_timer: 12, __v: 0 });
       print('added ' + s.imsi);
     }
+    {{- $epc := .Values.epc | default dict }}
     {{- range .Values.subscribers }}
+    {{- $dnn := .dnn | default "internet" }}
+    {{- $pgw := "" }}
+    {{- if and $epc.enabled $epc.pgwInHss }}
+    {{- $d := include "open5gs.epcDnnFor" (dict "ctx" $ "apn" $dnn) | fromYaml }}
+    {{- $pgw = required (printf "subscribers[%s]: epc.pgwInHss needs dnns[%s].clusterIP (the PGW address sent to the MME)" .imsi $dnn) $d.clusterIP }}
+    {{- end }}
     add({ imsi: {{ .imsi | quote }}, key: {{ .key | quote }}, opc: {{ .opc | quote }},
           amf: {{ .amf | default "8000" | quote }}, sst: {{ .sst | default 1 }},
-          sd: {{ .sd | default "" | quote }}, dnn: {{ .dnn | default "internet" | quote }},
-          ipv4: {{ .ipv4 | default "" | quote }} });
+          sd: {{ .sd | default "" | quote }}, dnn: {{ $dnn | quote }},
+          ipv4: {{ .ipv4 | default "" | quote }}, pgw: {{ $pgw | quote }} });
     {{- end }}
 ---
 apiVersion: batch/v1

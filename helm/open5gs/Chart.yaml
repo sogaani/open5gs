@@ -1,6 +1,6 @@
 apiVersion: v2
 name: open5gs
-description: Open5GS 5G core (one pod per NF), WebUI, MongoDB and UERANSIM gNB/UE simulator
+description: Open5GS 5G core (one pod per NF) with optional 4G EPC, WebUI, MongoDB, UERANSIM gNB/UE and srsRAN_4G eNB/UE simulators
 type: application
 version: 0.1.0
 appVersion: "2.7"

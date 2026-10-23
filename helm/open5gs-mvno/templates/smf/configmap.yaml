@@ -1,6 +1,7 @@
 {{- $root := . }}
 {{- range $d := .Values.dnns }}
 {{- $name := include "open5gs.dnnName" (dict "ctx" $root "prefix" "smf" "dnn" $d) }}
+{{- $epc := include "open5gs.isEpcDnn" (dict "ctx" $root "dnn" $d) }}
 ---
 # One SMF per dnns[] entry. Each SMF advertises only its own DNN (and, when the
 # entry sets sst, only that S-NSSAI) in SmfInfo, so the AMF selects it through
@@ -26,6 +27,13 @@ data:
           upf:
             - address: {{ include "open5gs.fqdn" (dict "ctx" $root "name" (include "open5gs.dnnName" (dict "ctx" $root "prefix" "upf" "dnn" $d))) }}
               dnn: {{ $d.name }}
+      {{- if $epc }}
+      # PGW-C for the 4G APN "{{ $d.name }}": S5/S8-C from the SGW-C, Gx to the PCRF
+      gtpc:
+        server:
+          - address: __POD_IP__
+      freeDiameter: /tmp/smf-fd.conf
+      {{- end }}
       gtpu:
         server:
           - address: __POD_IP__
@@ -52,4 +60,8 @@ data:
               dnn:
                 - {{ $d.name }}
             {{- end }}
+  {{- if $epc }}
+  smf-fd.conf: |
+    {{- include "open5gs.fdConf" (dict "ctx" $root "nf" "smf" "identity" (include "open5gs.fdIdentity" (dict "ctx" $root "name" $name)) "realm" (include "open5gs.epcRealm" (dict "ctx" $root)) "peers" (list (include "open5gs.fdIdentity" (dict "ctx" $root "name" "pcrf")))) | nindent 4 }}
+  {{- end }}
 {{- end }}
