@@ -244,12 +244,13 @@ spec:
             - name: s1u
               containerPort: 2152
               protocol: UDP
-          # Healthy = S1 association up (the first line of the proc file is a
-          # header) and the UE attached (tun_srsue has an address). Restarting
-          # the pod re-resolves the MME and restarts the eNB/UE pair.
+          # Healthy = an ESTABLISHED S1 association (state column 5 == 3; the
+          # eNB's reconnect attempts to a gone MME also appear there, in
+          # COOKIE_WAIT) and the UE attached (tun_srsue has an address).
+          # Restarting the pod re-resolves the MME and restarts the eNB/UE pair.
           livenessProbe:
             exec:
-              command: ["/bin/sh", "-c", "[ $(wc -l < /proc/net/sctp/assocs) -gt 1 ] && ip -4 -o addr show dev tun_srsue | grep -q inet"]
+              command: ["/bin/sh", "-c", "awk 'NR>1 && $5==3' /proc/net/sctp/assocs | grep -q . && ip -4 -o addr show dev tun_srsue | grep -q inet"]
             initialDelaySeconds: 90
             periodSeconds: 15
             failureThreshold: 6

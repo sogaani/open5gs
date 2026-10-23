@@ -243,7 +243,9 @@ The ZMQ virtual radio links exactly one `srsenb` to one `srsue`, and after a det
 restarted too, so each `srsran.ues[]` entry is one pod (`lte-<name>`) running both in one container
 (ZMQ over localhost). The entrypoint resolves the MME, substitutes the pod IP, starts both and adds
 a policy route for the UE address (srsue creates `tun_srsue` but no default route). The liveness
-probe restarts the pod when the S1 association is gone or the UE never attached. Each pair needs
+probe restarts the container when no S1 association is ESTABLISHED or the UE never attached;
+after an MME pod replacement the pair re-resolves the MME and re-attaches in about 3-4 minutes
+(SCTP failure detection plus the probe window). Each pair needs
 about 1-2 CPUs at 25 PRB; `srsran.ues[].resources` / `srsran.resources` set requests and limits.
 The image comes from `docker/srsran` (GHCR workflow, `ghcr.io/sogaani/srsran-4g`).
 
