@@ -1850,6 +1850,145 @@ kubectl -n mvno logs deploy/mvno-hss | grep 999710000000002
 kubectl -n mvno logs deploy/mvno-smf-internet | grep 999710000000002         # IPv4[10.50.x.x]
 ```
 
+### 14.6 MME の PGW 選択と LBO / HR の決まり方
+
+Open5GS の MME に「PLMN ベースの PGW 選択が無い」のは、LBO ができないという意味ではない。
+選択順 (`src/mme/mme-s11-build.c:123-168`) は次のとおりで、**何も指示しなければ訪問先 PGW
+(= LBO) に落ちる**。できないのは「IMSI の H-PLMN を見て PGW を切り替える」ことの方。
+
+| 優先 | 情報源 | キー | ローミングでの意味 |
+|---|---|---|---|
+| 1 | HSS の ULA (MIP6-Agent-Info → `session.smf.ipv4`) | 加入者 × APN | H-HSS がアドレスを渡せば **HR**。渡さなければ下へ |
+| 2 | DNS (S-NAPTR、`<APN-NI>.apn.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`) | APN × **serving PLMN** | 自網ゾーンしか引かない (`src/mme/mme-dns.c` の LIMITATION コメント) → V-PGW = **LBO** |
+| 3 | 静的 `gtpc.client.smf[]` | APN / TAC / eCellID | V-PGW = **LBO** |
+| 4 | 先頭エントリ | なし | V-PGW = **LBO** |
+
+* ラボで lte4 を LBO にしたければ MVNO 側 `epc.pgwInHss: false` にすれば MME は自網 SMF を選ぶ。
+  ただし Open5GS に S9 (V-PCRF ↔ H-PCRF) は無く、V-PCRF は自分の MongoDB で IMSI+APN を引くため、
+  **その IMSI を MNO 側 DB にも入れておかないと Gx CCA が失敗し Create Session が拒否される**。
+* HR か LBO かを決める軸は H-PLMN (IMSI) または加入者であり、V-PLMN の MCC/MNC (= MME 自身の
+  serving PLMN) ではない。Open5GS ではこれを **H-HSS の加入者データ (APN ごとの `smf.ipv4` の有無)**
+  で表現する。3GPP のモデル (HSS が PDN-GW-Allocation-Type / MIP6-Agent-Info で HR を指示、
+  VPLMN-Dynamic-Address-Allowed で LBO 可否を指示) に近い分担。
+* Open5GS HSS は VPLMN-Dynamic-Address-Allowed を常に ALLOWED で送り、MME はこの AVP を読まない
+  (`src/mme` に参照なし)。「H-PLMN が LBO を禁止する」制御は効かず、HR になるかは
+  「HSS が PGW アドレスを返したか」だけで決まる。
+
+### 14.7 一般的な MME の DNS による PGW 選択 (TS 23.003 / 29.303 / 23.401)
+
+APN-FQDN は `<APN-NI>.apn.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`。先頭が APN-NI (`internet`)、
+`mnc<MNC>.mcc<MCC>` の部分が APN-OI に相当する。どの PLMN の MCC/MNC を入れるかは HR / LBO で変わる。
+
+| ケース | APN-OI に入れる PLMN | 引く DNS | NAPTR サービス |
+|---|---|---|---|
+| LBO | serving PLMN (自網) | 自網 DNS | `x-3gpp-pgw:x-s5-gtp` |
+| HR | home PLMN (IMSI から導出、または HSS の APN-OI-Replacement) | IPX 経由の GSMA ルート DNS | `x-3gpp-pgw:x-s8-gtp` |
+
+* LBO の FQDN は APN-NI が主キーなので、APN ごとに別 PGW、order/preference で優先度、
+  `topon.` ラベルで SGW に近い PGW、といった制御が DNS だけでできる。Open5GS の DNS 解決と
+  `gtpc.client.smf[].apn` も同じ役割。
+* DNS で決まるのは「APN → どの PGW か」まで。HR にするか LBO にするかは HSS の
+  VPLMN-Dynamic-Address-Allowed と MME のローカルポリシーで先に決め、その結果でどちらの FQDN を
+  組むかが変わる。FQDN に IMSI は入らないので、同じ APN で H-PLMN ごとに LBO 先を変えるのも
+  DNS ではなく MME ポリシーの仕事。
+
+### 14.8 「S6a」はインターフェース名、プロトコルは Diameter
+
+S6a は 3GPP のリファレンスポイント (MME ↔ HSS) の名前で、その上を流れるプロトコルが Diameter
+(TS 29.272)。同時に **Diameter の「アプリケーション」の名前でもある**: Diameter は基底プロトコル
+(RFC 6733) の上にアプリケーションを定義する作りで、S6a には Application-Id 16777251、Gx には
+16777238、Rx には 16777236 が割り当てられている。CER/CEA でこの ID を交換して「S6a を話せる」ことを
+確認し、ルーティングも Destination-Realm + Application-Id で行う。
+
+| インターフェース | 両端 | プロトコル |
+|---|---|---|
+| S6a / S6d | MME / SGSN ↔ HSS | Diameter |
+| Gx / Rx / S9 | PGW-C ↔ PCRF / P-CSCF ↔ PCRF / V-PCRF ↔ H-PCRF | Diameter |
+| Cx / Sh | CSCF, AS ↔ HSS | Diameter |
+| S1-MME | eNB ↔ MME | S1AP over SCTP |
+| S11 / S5 / S8 | MME ↔ SGW-C / SGW ↔ PGW | GTPv2-C (+ GTP-U) |
+
+Open5GS でも二層が見える: freeDiameter 本体が基底プロトコル (ピア接続、CER/CEA、DWR/DWA、
+ルーティング)、`dict_*.fdx` 拡張と `lib/diameter/s6a` などのライブラリがアプリケーション辞書。
+
+### 14.9 freeDiameter configuration file
+
+Diameter ノード 1 つ分の「自分は誰で、どこで待ち受け、誰とつながり、どの拡張を読むか」。
+Open5GS では MME / HSS / PCRF / SMF (PGW-C) が各 1 つ持ち、NF の YAML の `freeDiameter:` キーで
+パスを指す。同梱サンプルは `configs/freeDiameter/*.conf.in`、チャートが生成するものは
+`_helpers.tpl` の `open5gs.fdConf`。書式は `Key = value;`、`#` はコメント。
+
+| 区分 | ディレクティブ | 意味 |
+|---|---|---|
+| 自分の名前 | `Identity` | Diameter Identity。CER の Origin-Host になり、相手の `ConnectPeer` 名と一致が必要 |
+| | `Realm` | Origin-Realm。省略時は Identity の最初のドット以降 |
+| 待ち受け | `ListenOn` | bind する IP。**IP リテラルのみ** |
+| | `Port` / `SecPort` | 平文 3868 / TLS 5868。`SecPort = 0` で TLS 待ち受けを無効化 |
+| | `No_SCTP` / `No_TCP` / `Prefer_TCP` / `No_IPv6` | トランスポート選択 (既定は SCTP 優先) |
+| TLS | `TLS_Cred` / `TLS_CA` | 証明書+鍵と CA。**CN が Identity と一致しないと起動失敗** |
+| タイマー | `TcTimer` / `TwTimer` | 再接続間隔 / DWR 間隔 (既定 30 秒) |
+| 振る舞い | `NoRelay` | 自分宛でないメッセージを中継しない (DRA でなければ付ける) |
+| 拡張 | `LoadExtension = "x.fdx" [: "conf"]` | `dict_*` (辞書)、`dbg_*` (フック)、`acl_*` / `rt_*` (ACL・ルーティング) |
+| ピア | `ConnectPeer = "<identity>" { ConnectTo; Port; No_TLS; No_SCTP; Realm; ... };` | 自分から接続しに行く相手 |
+
+* freeDiameter は `ConnectPeer` に書いたピアにだけ自分から接続し、**着信は既知のピアからしか受けない**。
+  相手の Identity は CER の Origin-Host で照合。`ConnectTo` が無ければ Identity を DNS で引く。
+  片側 (クライアント側) だけに `ConnectPeer` を書き、サーバー側は `acl_wl.fdx` で
+  `ALLOW_IPSEC *.open5gs.svc.cluster.local` のように許可するのがチャートの構成。
+* S6a / Gx 自体の辞書は `.fdx` ではなく Open5GS ライブラリがプロセス内で登録するので設定には出ない。
+* チャート版と同梱版の差: Identity = Service FQDN、Realm = `epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`、
+  `ListenOn = __POD_IP__` (起動時置換)、`No_SCTP` (ClusterIP Service を通すため TCP)、
+  `SecPort = 0` (同梱証明書の CN が `mme.localdomain` 固定で Identity と合わない)、
+  `ConnectPeer` に `ConnectTo` を書かず DNS に任せる。YAML インラインの `freeDiameter:` は
+  `no_sctp` や `acl_wl` を表現できないので `.conf` を ConfigMap で配る。
+
+### 14.10 MVNO 構成での Diameter ピア一覧 (レンダリング結果)
+
+ConnectPeer を持つのは「接続しに行く側」の MME と SMF だけ。HSS / PCRF は `acl_wl` で受ける側。
+
+MNO (`open5gs`、Realm `epc.mnc070.mcc999.3gppnetwork.org`):
+
+| モジュール | ConnectPeer | 着信許可 (acl_wl) |
+|---|---|---|
+| open5gs-mme | `open5gs-hss.open5gs.svc.cluster.local` (自網 S6a)、`mvno-hss.mvno.svc.cluster.local` (ローマー用、`roaming.peers[].epc.hss`) | なし |
+| open5gs-hss / open5gs-pcrf | なし | `*.open5gs.svc.cluster.local` |
+| open5gs-smf-internet-sst1 / open5gs-smf-ims | `open5gs-pcrf.open5gs.svc.cluster.local` (Gx) | なし |
+
+MVNO (`mvno`、Realm `epc.mnc071.mcc999.3gppnetwork.org`):
+
+| モジュール | ConnectPeer | 着信許可 (acl_wl) |
+|---|---|---|
+| mvno-hss / mvno-pcrf | なし | `*.mvno.svc.cluster.local`、`*.open5gs.svc.cluster.local` (訪問先 MME 用、`epc.diameter.allowedPeers`) |
+| mvno-smf-internet (PGW-C) | `mvno-pcrf.mvno.svc.cluster.local` (Gx) | なし |
+
+* **PLMN をまたぐ Diameter は MME → mvno-hss の S6a だけ**。S8 で H-PGW に来たセッションの Gx は
+  H-PLMN 内で閉じる。MNO PCRF と MVNO の間に接続は無い (S9 は Open5GS に無く、HR では不要)。
+* MME は 2 つの HSS と常時接続を張り、宛先は `hss_map` (IMSI 先頭 99971 → `epc.mnc071…` /
+  `mvno-hss…`) で選ぶ。ConnectPeer は「接続を維持する相手」、宛先選択は別レイヤー。
+* mvno-pcrf の `*.open5gs…` 許可は現状使われていない (狭めるなら HSS だけで十分)。
+
+### 14.11 実網で PLMN 境界を越える接続 (EPC)
+
+HR のデータローミング最小構成なら **S6a と S8 (+ DNS)** だけ。S9 は Diameter、GTP が境界を越えるのは
+S8 (S9 と S8 を混同しないこと)。
+
+| 境界を越える接続 | プロトコル | いつ必要か |
+|---|---|---|
+| S6a (MME ↔ H-HSS)、S6d / Gr (SGSN ↔ HSS/HLR) | Diameter / MAP | 常に (3G/2G は提供する場合) |
+| S8 (V-SGW ↔ H-PGW)、Gp (V-SGSN ↔ H-GGSN) | GTPv2-C + GTP-U / GTPv1 | HR のみ |
+| S9 (V-PCRF ↔ H-PCRF) | Diameter | **LBO のみ**が原則 |
+| DNS (MME → GSMA ルート DNS → H-PLMN DNS) | DNS | HR で H-PGW を S-NAPTR で探すとき |
+| SIP / RTP (II-NNI) | SIP, RTP | VoLTE を LBO で組む場合。S8HR なら IMS は S8 の中に閉じる |
+| SMS (SGs → MSC ↔ HLR/HSS、または SGd MME ↔ H-SMSC) | MAP / Diameter | SMS を提供する場合 |
+| S13 (MME ↔ H-EIR)、SLg/SLh、Lr | Diameter / MAP | 端末チェック、位置情報 (任意) |
+| TAP / BCE (課金レコード交換) | ファイル転送 (DCH) | オフラインで事後交換 |
+
+* 越えないもの: S1 / S11 / S5 / Gx (HR では H-PLMN 内) / Gy / Gz。S10 による PLMN 間ハンドオーバーは
+  仕様上可能だが商用ではほぼ使われず、PLMN 間の移動は再 Attach。
+* 全部 IPX (GRX) 上を流れ、Diameter は DRA / DEA、GTP は Border Gateway、SIP は IBCF で境界を通す。
+  5GC では SEPP (N32) と UPF 間の N9 が同じ役割。
+* 今回のラボは S6a だけ Diameter で越え、S8 の宛先を HSS の加入者データで渡しているので DNS を省いた形。
+
 ---
 
 ## 15. 参考
